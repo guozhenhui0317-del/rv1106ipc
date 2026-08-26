@@ -1,0 +1,26 @@
+# CMake out-of-source build directories and generated files
+/build/
+/build-*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiled target files
+*.o
+*.a
+*.so
+*.so.*
+gzh_ipc
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Runtime logs
+*.log
