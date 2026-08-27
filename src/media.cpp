@@ -237,8 +237,13 @@ private:
         require_ok(RK_MPI_VENC_CreateChn(id, &attr), "RK_MPI_VENC_CreateChn");
         venc_created_[id] = true;
         apply_quality(id, use_h265);
-        if (value(id, "enable_refer_buffer_share", 1))
-            require_ok(RK_MPI_VENC_EnableRefBufShare(id, RK_TRUE), "RK_MPI_VENC_EnableRefBufShare");
+        if (value(id, "enable_refer_buffer_share", 1)) {
+            VENC_CHN_REF_BUF_SHARE_S share;
+            memset(&share, 0, sizeof(share));
+            share.bEnable = RK_TRUE;
+            require_ok(RK_MPI_VENC_SetChnRefBufShareAttr(id, &share),
+                       "RK_MPI_VENC_SetChnRefBufShareAttr");
+        }
         VENC_RECV_PIC_PARAM_S receive;
         memset(&receive, 0, sizeof(receive));
         /* -1 表示持续编码，直到 stop() 显式停止接收。 */
@@ -325,15 +330,30 @@ private:
         memset(&pack, 0, sizeof(pack));
         memset(&stream, 0, sizeof(stream));
         stream.pstPack = &pack;
+        unsigned debug_frames = 0;
         while (running_) {
             const int ret = RK_MPI_VENC_GetStream(id, &stream, 1000);
             if (ret != RK_SUCCESS)
                 continue;
-            /* pack.u32Offset 必须计入；同一 MB 中码流有效区不保证从字节 0 开始。 */
+            /*
+             * 本 SDK 与官方 RV1106 RKIPC Demo 均直接使用 Handle2VirAddr 返回值。
+             * 返回的 MB 句柄已指向本次有效码流；u32Offset 是底层环形缓冲区位置，
+             * 不能再次叠加，否则会越过本次映射的 u32Len 字节。
+             */
             uint8_t *base = static_cast<uint8_t *>(RK_MPI_MB_Handle2VirAddr(pack.pMbBlk));
-            if (base && pack.u32Len)
-                ffmpeg_publisher_write_video(id, base + pack.u32Offset, pack.u32Len,
+            if (base && pack.u32Len) {
+                if (debug_frames++ < 6)
+                    LOG_INFO("VENC%d frame: seq=%u len=%u offset=%u mb=%llu data_num=%u "
+                             "frame_end=%d stream_end=%d type=%d pts=%llu",
+                             id, stream.u32Seq, pack.u32Len, pack.u32Offset,
+                             static_cast<unsigned long long>(RK_MPI_MB_GetSize(pack.pMbBlk)),
+                             pack.u32DataNum, pack.bFrameEnd, pack.bStreamEnd,
+                             h265(id) ? static_cast<int>(pack.DataType.enH265EType)
+                                      : static_cast<int>(pack.DataType.enH264EType),
+                             static_cast<unsigned long long>(pack.u64PTS));
+                ffmpeg_publisher_write_video(id, base, pack.u32Len,
                                              pack.u64PTS, key_frame(id, pack));
+            }
             /* publisher 已复制 AVPacket，故此处可立即把硬件 buffer 还给 VENC。 */
             RK_MPI_VENC_ReleaseStream(id, &stream);
         }

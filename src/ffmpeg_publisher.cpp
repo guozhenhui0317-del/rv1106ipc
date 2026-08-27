@@ -37,8 +37,18 @@ namespace {
  * 首个关键帧到达时扫描这些 NAL，并保持原始 Annex-B 格式存入 extradata。
  * 普通 slice/SEI 不属于全局参数，故不复制，避免 header 随帧内容膨胀。
  */
-std::string parameter_sets(const uint8_t *data, size_t size, AVCodecID codec) {
-    std::string out;
+struct ParameterSets {
+    std::string data;
+    unsigned found = 0;
+
+    bool complete(AVCodecID codec) const {
+        return (found & (codec == AV_CODEC_ID_H264 ? 0x3u : 0x7u)) ==
+               (codec == AV_CODEC_ID_H264 ? 0x3u : 0x7u);
+    }
+};
+
+ParameterSets parameter_sets(const uint8_t *data, size_t size, AVCodecID codec) {
+    ParameterSets out;
     size_t pos = 0;
     while (pos + 4 < size) {
         size_t start = size;
@@ -65,14 +75,27 @@ std::string parameter_sets(const uint8_t *data, size_t size, AVCodecID codec) {
         const uint8_t type = codec == AV_CODEC_ID_H264
                                  ? data[start + prefix] & 0x1f
                                  : (data[start + prefix] >> 1) & 0x3f;
-        const bool wanted = codec == AV_CODEC_ID_H264
-                                ? (type == 7 || type == 8)
-                                : (type == 32 || type == 33 || type == 34);
-        if (wanted)
-            out.append(reinterpret_cast<const char *>(data + start), end - start);
+        const unsigned flag = codec == AV_CODEC_ID_H264
+                                  ? (type == 7 ? 1u : type == 8 ? 2u : 0u)
+                                  : (type == 32 ? 1u : type == 33 ? 2u : type == 34 ? 4u : 0u);
+        if (flag && !(out.found & flag)) {
+            out.data.append(reinterpret_cast<const char *>(data + start), end - start);
+            out.found |= flag;
+        }
         pos = end;
     }
     return out;
+}
+
+std::string hex_prefix(const void *data, size_t size) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    const size_t count = std::min<size_t>(size, 16);
+    char text[16 * 3 + 1];
+    size_t pos = 0;
+    for (size_t i = 0; i < count; ++i)
+        pos += static_cast<size_t>(snprintf(text + pos, sizeof(text) - pos,
+                                            i ? " %02x" : "%02x", bytes[i]));
+    return std::string(text, pos);
 }
 
 const char *video_text(int id, const char *field, const char *fallback) {
@@ -97,8 +120,10 @@ bool publisher_self_check() {
         0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f,
         0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
         0, 0, 0, 1, 0x65, 0x88};
-    const std::string extra = parameter_sets(h264, sizeof(h264), AV_CODEC_ID_H264);
-    return extra.size() == 16 && !memcmp(extra.data(), h264, 16);
+    const ParameterSets extra = parameter_sets(h264, sizeof(h264), AV_CODEC_ID_H264);
+    return extra.complete(AV_CODEC_ID_H264) && extra.data.size() == 16 &&
+           !memcmp(extra.data.data(), h264, 16) &&
+           !parameter_sets(h264, 8, AV_CODEC_ID_H264).complete(AV_CODEC_ID_H264);
 }
 
 int video_value(int id, const char *field, int fallback) {
@@ -143,10 +168,25 @@ public:
          * 完整 GOP 开始解码；3 秒退避避免服务器离线时高速重复连接刷日志。
          */
         std::lock_guard<std::mutex> guard(lock_);
+        if (key) {
+            const ParameterSets current = parameter_sets(static_cast<const uint8_t *>(data), size,
+                                                         video_codec(config_.stream_id));
+            if (current.complete(video_codec(config_.stream_id)) &&
+                current.data != codec_extra_) {
+                codec_extra_ = current.data;
+                LOG_INFO("%s cached complete parameter sets: mask=%#x size=%zu",
+                         config_.name.c_str(), current.found, codec_extra_.size());
+            } else if (codec_extra_.empty() && incomplete_key_logs_++ < 3) {
+                LOG_WARN("%s drops incomplete key frame: mask=%#x size=%zu head=%s",
+                         config_.name.c_str(), current.found, size,
+                         hex_prefix(data, size).c_str());
+            }
+        }
         if (!ready_) {
-            if (!key || std::chrono::steady_clock::now() < retry_after_)
+            if (!key || codec_extra_.empty() ||
+                std::chrono::steady_clock::now() < retry_after_)
                 return 0;
-            if (open(static_cast<const uint8_t *>(data), size, pts_us) != 0) {
+            if (open(size, pts_us) != 0) {
                 retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
                 return -1;
             }
@@ -168,7 +208,7 @@ public:
     }
 
 private:
-    int open(const uint8_t *first_key_frame, size_t size, uint64_t pts_us) {
+    int open(size_t first_key_size, uint64_t pts_us) {
         /* 每次重连都从全新的 context 开始，旧 socket/stream 状态不能复用。 */
         close();
         int ret = avformat_alloc_output_context2(&context_, nullptr, config_.format.c_str(),
@@ -193,15 +233,13 @@ private:
             video_value(config_.stream_id, "dst_frame_rate_num", 25),
             video_value(config_.stream_id, "dst_frame_rate_den", 1)};
 
-        /* muxer header 必须先于媒体包发送，所以只能从首个关键帧取得参数集。 */
-        const std::string extra = parameter_sets(first_key_frame, size, vp->codec_id);
-        if (extra.empty())
-            return fail("key frame has no SPS/PPS (or VPS)", AVERROR_INVALIDDATA);
-        vp->extradata = static_cast<uint8_t *>(av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        /* 首次取得后缓存参数集，断线时只需等下一关键帧，不要求编码器再次重复参数集。 */
+        vp->extradata = static_cast<uint8_t *>(
+            av_mallocz(codec_extra_.size() + AV_INPUT_BUFFER_PADDING_SIZE));
         if (!vp->extradata)
             return fail("cannot allocate codec extradata", AVERROR(ENOMEM));
-        memcpy(vp->extradata, extra.data(), extra.size());
-        vp->extradata_size = static_cast<int>(extra.size());
+        memcpy(vp->extradata, codec_extra_.data(), codec_extra_.size());
+        vp->extradata_size = static_cast<int>(codec_extra_.size());
 
         if (config_.audio) {
             /*
@@ -252,6 +290,10 @@ private:
         origin_us_ = pts_us;
         ready_ = true;
         LOG_INFO("%s publishing to %s", config_.name.c_str(), config_.url.c_str());
+        if (config_.format == "flv")
+            LOG_INFO("%s RTMP header: key_size=%zu extra=%zu video_tb=%d/%d audio=%d",
+                     config_.name.c_str(), first_key_size, codec_extra_.size(),
+                     video_->time_base.num, video_->time_base.den, audio_ ? 1 : 0);
         return 0;
     }
 
@@ -289,12 +331,19 @@ private:
         }
         if (key)
             packet.flags |= AV_PKT_FLAG_KEY;
+        unsigned &debug_count = stream == video_ ? video_debug_packets_ : audio_debug_packets_;
+        if (config_.format == "flv" && debug_count++ < 6)
+            LOG_INFO("%s RTMP input %s: size=%zu pts_us=%llu pts=%lld duration=%lld key=%d head=%s",
+                     config_.name.c_str(), stream == video_ ? "video" : "audio", size,
+                     static_cast<unsigned long long>(pts_us), static_cast<long long>(packet.pts),
+                     static_cast<long long>(packet.duration), key ? 1 : 0,
+                     hex_prefix(data, size).c_str());
         /* interleaved 接口按时间戳交织主流音视频；AI 流只有视频，行为相同。 */
         ret = av_interleaved_write_frame(context_, &packet);
         av_packet_unref(&packet);
         if (ret < 0) {
             LOG_ERROR("%s write failed: %s", config_.name.c_str(), error_text(ret).c_str());
-            close();
+            close(false);
             retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
             return -1;
         }
@@ -313,11 +362,11 @@ private:
         return text;
     }
 
-    void close() {
+    void close(bool write_trailer = true) {
         /* close() 可重复调用，供正常析构、打开失败和运行期断线共同使用。 */
         if (!context_)
             return;
-        if (ready_)
+        if (ready_ && write_trailer)
             av_write_trailer(context_);
         if (!(context_->oformat->flags & AVFMT_NOFILE) && context_->pb)
             avio_closep(&context_->pb);
@@ -333,7 +382,11 @@ private:
     AVStream *video_ = nullptr;
     AVStream *audio_ = nullptr;
     uint64_t origin_us_ = 0;
+    std::string codec_extra_;
     bool ready_ = false;
+    unsigned incomplete_key_logs_ = 0;
+    unsigned video_debug_packets_ = 0;
+    unsigned audio_debug_packets_ = 0;
     std::mutex lock_;
     std::chrono::steady_clock::time_point retry_after_{};
 };

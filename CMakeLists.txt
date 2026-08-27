@@ -4,12 +4,12 @@ project(gzh_ipc LANGUAGES C CXX)
 # These paths must point to RV1106 target files, not host/x86 libraries.
 set(ROCKCHIP_SDK_ROOT "" CACHE PATH "RV1106 SDK staging/sysroot root")
 set(FFMPEG_ROOT "" CACHE PATH "RV1106 FFmpeg 4.x installation prefix")
-set(EASYLOGGER_ROOT "" CACHE PATH "EasyLogger source root")
+set(EASYLOGGER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/EasyLogger" CACHE PATH "EasyLogger source root")
 set(ROCKCHIP_INCLUDE_DIR "${ROCKCHIP_SDK_ROOT}/usr/include" CACHE PATH "Rockchip include directory")
 set(ROCKCHIP_SYSUTILS_INCLUDE_DIR "${ROCKCHIP_INCLUDE_DIR}" CACHE PATH "Directory containing rk_gpio.h and rk_pwm.h")
 set(ROCKCHIP_LIB_DIR "${ROCKCHIP_SDK_ROOT}/usr/lib" CACHE PATH "Rockchip target library directory")
 
-foreach(required ROCKCHIP_SDK_ROOT FFMPEG_ROOT EASYLOGGER_ROOT)
+foreach(required ROCKCHIP_SDK_ROOT FFMPEG_ROOT)
   if("${${required}}" STREQUAL "")
     message(FATAL_ERROR "${required} is required; see README.md")
   endif()
@@ -55,8 +55,10 @@ set_target_properties(gzh_ipc PROPERTIES
   C_STANDARD_REQUIRED YES
   CXX_STANDARD 11
   CXX_STANDARD_REQUIRED YES
+  SKIP_BUILD_RPATH YES
+  LINK_FLAGS "-Wl,-rpath-link,${ROCKCHIP_LIB_DIR}"
 )
-target_compile_definitions(gzh_ipc PRIVATE ELOG_OUTPUT_ENABLE ISP_HW_V32)
+target_compile_definitions(gzh_ipc PRIVATE ISP_HW_V32)
 target_compile_options(gzh_ipc PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 target_include_directories(gzh_ipc PRIVATE
@@ -86,6 +88,7 @@ target_include_directories(gzh_ipc PRIVATE
 target_link_libraries(gzh_ipc PRIVATE
   pthread m
   rockit rockchip_mpp rkaiq rockiva rknnmrt rga rksysutils
+  rkaudio_detect aec_bf_process rkaudio
   avformat avcodec avutil
 )
 

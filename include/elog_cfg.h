@@ -1,0 +1,15 @@
+#ifndef RV1106_CUSTOM_ELOG_CFG_H
+#define RV1106_CUSTOM_ELOG_CFG_H
+
+/* 本项目使用同步输出，确保 Logger 析构后没有 EasyLogger 后台线程残留。 */
+#define ELOG_OUTPUT_ENABLE
+#define ELOG_OUTPUT_LVL ELOG_LVL_VERBOSE
+#define ELOG_ASSERT_ENABLE
+#define ELOG_LINE_BUF_SIZE 1024
+#define ELOG_LINE_NUM_MAX_LEN 5
+#define ELOG_FILTER_TAG_MAX_LEN 30
+#define ELOG_FILTER_KW_MAX_LEN 16
+#define ELOG_FILTER_TAG_LVL_MAX_NUM 5
+#define ELOG_NEWLINE_SIGN "\n"
+
+#endif

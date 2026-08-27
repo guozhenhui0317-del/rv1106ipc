@@ -23,7 +23,7 @@ ElogErrCode elog_port_init(void) {
     /* 追加模式保留上次启动日志；行缓冲保证异常退出前的大多数日志已落盘。 */
     g_log_file = fopen(g_log_path, "a");
     if (!g_log_file)
-        return ELOG_ERR;
+        return (ElogErrCode)-1;
     setvbuf(g_log_file, NULL, _IOLBF, 0);
     return ELOG_NO_ERR;
 }
