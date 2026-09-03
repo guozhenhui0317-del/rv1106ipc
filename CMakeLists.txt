@@ -4,7 +4,7 @@ project(gzh_ipc LANGUAGES C CXX)
 # These paths must point to RV1106 target files, not host/x86 libraries.
 set(ROCKCHIP_SDK_ROOT "" CACHE PATH "RV1106 SDK staging/sysroot root")
 set(FFMPEG_ROOT "" CACHE PATH "RV1106 FFmpeg 4.x installation prefix")
-set(EASYLOGGER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/EasyLogger" CACHE PATH "EasyLogger source root")
+set(EASYLOGGER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/common/easylogger")
 set(ROCKCHIP_INCLUDE_DIR "${ROCKCHIP_SDK_ROOT}/usr/include" CACHE PATH "Rockchip include directory")
 set(ROCKCHIP_SYSUTILS_INCLUDE_DIR "${ROCKCHIP_INCLUDE_DIR}" CACHE PATH "Directory containing rk_gpio.h and rk_pwm.h")
 set(ROCKCHIP_LIB_DIR "${ROCKCHIP_SDK_ROOT}/usr/lib" CACHE PATH "Rockchip target library directory")
@@ -22,9 +22,9 @@ set(REQUIRED_EXTERNAL_FILES
   "${ROCKCHIP_SYSUTILS_INCLUDE_DIR}/rk_gpio.h"
   "${ROCKCHIP_SYSUTILS_INCLUDE_DIR}/rk_pwm.h"
   "${FFMPEG_ROOT}/include/libavformat/avformat.h"
-  "${EASYLOGGER_ROOT}/easylogger/inc/elog.h"
-  "${EASYLOGGER_ROOT}/easylogger/src/elog.c"
-  "${EASYLOGGER_ROOT}/easylogger/src/elog_utils.c"
+  "${EASYLOGGER_DIR}/include/elog.h"
+  "${EASYLOGGER_DIR}/src/elog.c"
+  "${EASYLOGGER_DIR}/src/elog_utils.c"
 )
 foreach(required_file IN LISTS REQUIRED_EXTERNAL_FILES)
   if(NOT EXISTS "${required_file}")
@@ -44,8 +44,8 @@ set(APP_SOURCES
   common/param/param.c
   common/isp/rv1106/isp.c
   common/rockiva/rockiva.c
-  ${EASYLOGGER_ROOT}/easylogger/src/elog.c
-  ${EASYLOGGER_ROOT}/easylogger/src/elog_utils.c
+  ${EASYLOGGER_DIR}/src/elog.c
+  ${EASYLOGGER_DIR}/src/elog_utils.c
 )
 
 link_directories(${ROCKCHIP_LIB_DIR} ${FFMPEG_ROOT}/lib)
@@ -79,12 +79,12 @@ target_include_directories(gzh_ipc PRIVATE
   ${ROCKCHIP_INCLUDE_DIR}/rkaiq/iq_parser_v2
   ${ROCKCHIP_INCLUDE_DIR}/libdrm
   ${FFMPEG_ROOT}/include
-  ${EASYLOGGER_ROOT}/easylogger/inc
+  ${EASYLOGGER_DIR}/include
 )
 
 # Rockchip SDK: MPI/Rockit, MPP, ISP/IQ, RockIVA/NPU, RGA and system utilities.
 # FFmpeg 4.x: avformat provides RTSP/RTMP/FLV; avcodec/avutil provide codec metadata and timestamps.
-# EasyLogger is compiled from EASYLOGGER_ROOT above; no prebuilt EasyLogger library is needed.
+# EasyLogger is compiled from common/easylogger; no prebuilt EasyLogger library is needed.
 target_link_libraries(gzh_ipc PRIVATE
   pthread m
   rockit rockchip_mpp rkaiq rockiva rknnmrt rga rksysutils

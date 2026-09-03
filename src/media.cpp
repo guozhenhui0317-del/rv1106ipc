@@ -48,6 +48,14 @@ constexpr int kAi = 1;
 constexpr int kAenc = 0;
 constexpr int kOverlay = 7;
 
+/**
+ * @brief 检查 Rockchip API 返回码并把失败转换为异常。
+ *
+ * @param[in] ret Rockchip SDK 返回码。
+ * @param[in] operation 当前 SDK 操作名称。
+ *
+ * @throws std::runtime_error 初始化或 SDK 操作失败。
+ */
 void require_ok(int ret, const char *operation) {
     /* 构造阶段统一转成异常，外层 RAII 会按成功标志回滚此前创建的资源。 */
     if (ret != RK_SUCCESS) {
@@ -56,20 +64,53 @@ void require_ok(int ret, const char *operation) {
     }
 }
 
+/**
+ * @brief 读取 video.N 整数配置。
+ *
+ * @param[in] id 媒体通道编号。
+ * @param[in] name 名称或配置字段名。
+ * @param[in] fallback 配置项不存在时使用的缺省值。
+ *
+ * @return 配置值或 fallback。
+ */
 int value(int id, const char *name, int fallback) {
     char key[64];
     snprintf(key, sizeof(key), "video.%d:%s", id, name);
     return rk_param_get_int(key, fallback);
 }
 
+/**
+ * @brief 读取 video.N 字符串配置。
+ *
+ * @param[in] id 媒体通道编号。
+ * @param[in] name 名称或配置字段名。
+ * @param[in] fallback 配置项不存在时使用的缺省值。
+ *
+ * @return 配置字符串指针。
+ */
 const char *text(int id, const char *name, const char *fallback) {
     char key[64];
     snprintf(key, sizeof(key), "video.%d:%s", id, name);
     return rk_param_get_string(key, fallback);
 }
 
+/**
+ * @brief 判断视频通道是否配置为 H.265。
+ *
+ * @param[in] id 媒体通道编号。
+ *
+ * @return true 表示 H.265，false 表示 H.264。
+ */
 bool h265(int id) { return strcmp(text(id, "output_data_type", "H.264"), "H.265") == 0; }
 
+/**
+ * @brief 判断 VENC 包是否为关键帧。
+ *
+ * @param[in] id 媒体通道编号。
+ * @param[in] pack VENC 输出数据包。
+ *
+ * @return true 表示 IDR/I 帧，false 表示普通帧。
+ */
 bool key_frame(int id, const VENC_PACK_S &pack) {
     /* I slice 也可作为恢复点；publisher 会进一步确认其中包含参数集。 */
     if (h265(id))
@@ -81,6 +122,11 @@ bool key_frame(int id, const VENC_PACK_S &pack) {
 
 class Video final {
 public:
+    /**
+     * @brief 创建两路 VI/VENC、可选 RGN，并启动视频线程。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     Video() {
         try {
             /*
@@ -112,9 +158,17 @@ public:
         }
     }
 
+    /**
+     * @brief 停止视频线程并释放视频资源。
+     */
     ~Video() { stop(); }
 
 private:
+    /**
+     * @brief 配置并启用 VI 设备 0。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     void init_device() {
         /*
          * 官方 rkipc 或其他进程可能已配置 VI device。先查询状态，只补做缺失
@@ -137,6 +191,13 @@ private:
         device_ = true;
     }
 
+    /**
+     * @brief 创建并启用指定 VI 通道。
+     *
+     * @param[in] id 媒体通道编号。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     void create_vi(int id) {
         /*
          * 两路 VI 都输出 NV12/DMABUF。主路 depth=0，仅由 bind 直送 VENC，
@@ -162,6 +223,14 @@ private:
         vi_created_[id] = true;
     }
 
+    /**
+     * @brief 设置 VENC 帧率、GOP 和码率控制属性。
+     *
+     * @param[in,out] attr 待读取或修改的通道属性。
+     * @param[in] id 媒体通道编号。
+     * @param[in] use_h265 是否使用 H.265 编码参数。
+     * @param[in] cbr 是否使用 CBR 码率控制。
+     */
     void set_rate(VENC_CHN_ATTR_S &attr, int id, bool use_h265, bool cbr) {
         /*
          * RK SDK 为 H264/H265、CBR/VBR 提供四套不同结构体，字段意义相同但
@@ -203,6 +272,13 @@ private:
         }
     }
 
+    /**
+     * @brief 创建、配置并启动指定 VENC 通道。
+     *
+     * @param[in] id 媒体通道编号。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     void create_venc(int id) {
         /* VENC 完成硬件编码；后续 FFmpeg 只封装，不再次编码。 */
         VENC_CHN_ATTR_S attr;
@@ -251,6 +327,14 @@ private:
         require_ok(RK_MPI_VENC_StartRecvFrame(id, &receive), "RK_MPI_VENC_StartRecvFrame");
     }
 
+    /**
+     * @brief 应用画质等级和 QP 范围。
+     *
+     * @param[in] id 媒体通道编号。
+     * @param[in] use_h265 是否使用 H.265 编码参数。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     void apply_quality(int id, bool use_h265) {
         /*
          * 将官方 INI 的文字质量等级映射为最小 QP：QP 越小画质越高、码率越大。
@@ -282,6 +366,13 @@ private:
         require_ok(RK_MPI_VENC_SetRcParam(id, &rc), "RK_MPI_VENC_SetRcParam");
     }
 
+    /**
+     * @brief 把同编号 VI 绑定到 VENC。
+     *
+     * @param[in] id 媒体通道编号。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     void bind(int id) {
         /* VI->VENC 由内核/媒体框架直接传递 MB，应用不搬运原始 1080p 图像。 */
         MPP_CHN_S src = {RK_ID_VI, kViDev, id};
@@ -290,6 +381,11 @@ private:
         bound_[id] = true;
     }
 
+    /**
+     * @brief 创建 2BPP 检测框并绑定到 VENC1。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     void create_overlay() {
         /*
          * RGN 绑定在 VENC1 输入侧，因此框会被编码进 AI 子码流，但不会污染
@@ -322,6 +418,11 @@ private:
         overlay_attached_ = true;
     }
 
+    /**
+     * @brief 持续取得 VENC 码流并交给 publisher。
+     *
+     * @param[in] id 媒体通道编号。
+     */
     void venc_loop(int id) {
         /* 每个 VENC 独立阻塞取流，避免一路网络/编码抖动阻塞另一路。 */
         prctl(PR_SET_NAME, id == kMain ? "venc-main" : "venc-ai", 0, 0, 0);
@@ -359,6 +460,9 @@ private:
         }
     }
 
+    /**
+     * @brief 从 VI1 取得 DMABUF 帧并送入 RockIVA。
+     */
     void inference_loop() {
         /*
          * AI 推理频率通常低于编码帧率。用 steady_clock 限频不会受系统时间校准
@@ -386,6 +490,18 @@ private:
         }
     }
 
+    /**
+     * @brief 在 2BPP canvas 中绘制裁剪后的空心矩形。
+     *
+     * @param[in,out] buffer 待绘制的 2BPP 画布。
+     * @param[in] stride 画布的虚拟宽度。
+     * @param[in] height 画布高度。
+     * @param[in] x 矩形左上角横坐标。
+     * @param[in] y 矩形左上角纵坐标。
+     * @param[in] width 矩形宽度。
+     * @param[in] rect_height 矩形高度。
+     * @param[in] color 2BPP 颜色填充值。
+     */
     static void rectangle(uint8_t *buffer, int stride, int height,
                           int x, int y, int width, int rect_height, uint8_t color) {
         /*
@@ -413,6 +529,9 @@ private:
         }
     }
 
+    /**
+     * @brief 读取检测结果并周期性刷新 VENC1 Overlay。
+     */
     void overlay_loop() {
         /*
          * RockIVA 回调和 RGN canvas 更新解耦：本线程取最新检测结果，以 25 Hz
@@ -459,6 +578,9 @@ private:
         }
     }
 
+    /**
+     * @brief 停止视频线程并反序释放 RGN、VENC 和 VI。
+     */
     void stop() noexcept {
         /*
          * 先置 false 并等待所有线程退出，保证没有线程再访问 MPI handle；随后
@@ -515,6 +637,11 @@ private:
 
 class Audio final {
 public:
+    /**
+     * @brief 创建 AI0、可选 VQE、AENC0 并启动音频线程。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     Audio() {
         try {
             /* 本工程沿用官方 G711A 配置；FFmpeg 只复用编码结果，不做重采样。 */
@@ -585,9 +712,15 @@ public:
             throw;
         }
     }
+    /**
+     * @brief 停止音频线程并释放音频资源。
+     */
     ~Audio() { stop(); }
 
 private:
+    /**
+     * @brief 持续取得 AENC0 数据并交给主码流 publisher。
+     */
     void loop() {
         /* AENC PTS 原样传给 publisher，与 VENC PTS 共用 RK MPI 微秒时间轴。 */
         prctl(PR_SET_NAME, "aenc-main", 0, 0, 0);
@@ -602,6 +735,9 @@ private:
             RK_MPI_AENC_ReleaseStream(kAenc, &stream);
         }
     }
+    /**
+     * @brief 停止音频线程并反序销毁 AI 到 AENC 链路。
+     */
     void stop() noexcept {
         /* 先停取流线程，再解除 AI->AENC 绑定，最后由下游向上游销毁。 */
         running_ = false;
@@ -625,9 +761,16 @@ private:
 
 } // namespace
 
-class MediaRuntime::Impl final {
+class MediaRuntime::MediaPipeline final {
 public:
-    explicit Impl(const std::string &iq_dir) {
+    /**
+     * @brief 初始化 ISP、可选 RockIVA、MPI、推流、视频和音频。
+     *
+     * @param[in] iq_dir RKAIQ IQ 文件目录。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
+    explicit MediaPipeline(const std::string &iq_dir) {
         try {
             /*
              * ISP 必须最先读取 SC3336 IQ；RockIVA 在推理线程前初始化；MPI 全局
@@ -657,9 +800,15 @@ public:
             throw;
         }
     }
-    ~Impl() { stop(); }
+    /**
+     * @brief 触发完整媒体运行时的反序清理。
+     */
+    ~MediaPipeline() { stop(); }
 
 private:
+    /**
+     * @brief 按依赖反序停止完整媒体系统。
+     */
     void stop() noexcept {
         /*
          * 反序关闭很重要：先让音视频线程停止写 publisher，再关闭 FFmpeg；
@@ -677,6 +826,16 @@ private:
     std::unique_ptr<Audio> audio_;
 };
 
+/**
+ * @brief 创建 MediaPipeline 并启动完整媒体链路。
+ *
+ * @param[in] iq_file_dir RKAIQ IQ 文件目录。
+ *
+ * @throws std::runtime_error 初始化或 SDK 操作失败。
+ */
 MediaRuntime::MediaRuntime(const std::string &iq_file_dir)
-    : impl_(new Impl(iq_file_dir)) {}
+    : pipeline_(new MediaPipeline(iq_file_dir)) {}
+/**
+ * @brief 销毁 MediaPipeline 并释放全部媒体资源。
+ */
 MediaRuntime::~MediaRuntime() = default;

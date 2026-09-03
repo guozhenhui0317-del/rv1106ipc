@@ -5,6 +5,13 @@
 
 extern "C" void elog_port_set_file(const char *path);
 
+/**
+ * @brief 初始化并启动 EasyLogger。
+ *
+ * @param[in] path 文件路径。
+ *
+ * @throws std::runtime_error 初始化或 SDK 操作失败。
+ */
 Logger::Logger(const std::string &path) {
     /* 必须在 elog_init() 前传入文件名，因为端口初始化阶段就会打开文件。 */
     elog_port_set_file(path.c_str());
@@ -19,12 +26,20 @@ Logger::Logger(const std::string &path) {
     configure(2);
 }
 
+/**
+ * @brief 停止并反初始化 EasyLogger。
+ */
 Logger::~Logger() {
     /* elog_stop() 先阻止新输出，elog_deinit() 再调用端口层关闭文件。 */
     elog_stop();
     elog_deinit();
 }
 
+/**
+ * @brief 设置 EasyLogger 的输出过滤等级。
+ *
+ * @param[in] level 日志等级。
+ */
 void Logger::configure(int level) {
     /* INI 使用更直观的 0..3，下面转换为 EasyLogger 自身的等级枚举。 */
     if (level < 0)

@@ -1,3 +1,0 @@
-[submodule "third_party/EasyLogger"]
-	path = third_party/EasyLogger
-	url = https://github.com/armink/EasyLogger.git

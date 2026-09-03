@@ -11,12 +11,36 @@
  */
 class Logger final {
 public:
+    /**
+     * @brief 创建并启动日志系统。
+     *
+     * @param[in] path 文件路径。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     explicit Logger(const std::string &path);
+    /**
+     * @brief 停止日志系统并释放资源。
+     */
     ~Logger();
+    /**
+     * @brief 禁止复制 Logger。
+     *
+     * @details 参数：另一个 Logger 引用；接口不可调用。
+     */
     Logger(const Logger &) = delete;
+    /**
+     * @brief 禁止复制赋值 Logger。
+     *
+     * @details 参数：另一个 Logger 引用；接口不可调用。
+     */
     Logger &operator=(const Logger &) = delete;
 
-    /** 设置 0=ERROR、1=WARN、2=INFO、3=DEBUG，越界值会被夹到有效范围。 */
+    /**
+     * @brief 设置日志过滤等级。
+     *
+     * @param[in] level 日志等级。
+     */
     void configure(int level);
 };
 

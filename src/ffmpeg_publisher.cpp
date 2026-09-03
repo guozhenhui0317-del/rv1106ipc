@@ -41,12 +41,28 @@ struct ParameterSets {
     std::string data;
     unsigned found = 0;
 
+    /**
+     * @brief 判断参数集是否满足指定编码格式。
+     *
+     * @param[in] codec FFmpeg 编码格式标识。
+     *
+     * @return true 表示完整，false 表示缺少参数集。
+     */
     bool complete(AVCodecID codec) const {
         return (found & (codec == AV_CODEC_ID_H264 ? 0x3u : 0x7u)) ==
                (codec == AV_CODEC_ID_H264 ? 0x3u : 0x7u);
     }
 };
 
+/**
+ * @brief 扫描 Annex-B 并提取 SPS/PPS/VPS。
+ *
+ * @param[in] data 待处理数据的首地址。
+ * @param[in] size 待处理数据的字节数。
+ * @param[in] codec FFmpeg 编码格式标识。
+ *
+ * @return 参数集数据和位掩码。
+ */
 ParameterSets parameter_sets(const uint8_t *data, size_t size, AVCodecID codec) {
     ParameterSets out;
     size_t pos = 0;
@@ -87,6 +103,14 @@ ParameterSets parameter_sets(const uint8_t *data, size_t size, AVCodecID codec) 
     return out;
 }
 
+/**
+ * @brief 格式化数据开头最多 16 字节。
+ *
+ * @param[in] data 待处理数据的首地址。
+ * @param[in] size 待处理数据的字节数。
+ *
+ * @return 十六进制字符串。
+ */
 std::string hex_prefix(const void *data, size_t size) {
     const uint8_t *bytes = static_cast<const uint8_t *>(data);
     const size_t count = std::min<size_t>(size, 16);
@@ -98,6 +122,15 @@ std::string hex_prefix(const void *data, size_t size) {
     return std::string(text, pos);
 }
 
+/**
+ * @brief 读取 video.N 字符串配置。
+ *
+ * @param[in] id 媒体通道编号。
+ * @param[in] field INI 配置字段名。
+ * @param[in] fallback 配置项不存在时使用的缺省值。
+ *
+ * @return 配置字符串指针。
+ */
 const char *video_text(int id, const char *field, const char *fallback) {
     /* 统一拼接 video.<通道>:<字段>，避免各调用点散落硬编码键名。 */
     char key[64];
@@ -105,11 +138,23 @@ const char *video_text(int id, const char *field, const char *fallback) {
     return rk_param_get_string(key, fallback);
 }
 
+/**
+ * @brief 把通道编码配置转换为 FFmpeg 编码 ID。
+ *
+ * @param[in] id 媒体通道编号。
+ *
+ * @return  H.264 或 HEVC 编码 ID。
+ */
 AVCodecID video_codec(int id) {
     const char *name = video_text(id, "output_data_type", "H.264");
     return !strcmp(name, "H.265") ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
 }
 
+/**
+ * @brief 用内置数据验证参数集解析器。
+ *
+ * @return true 表示自检通过，false 表示失败。
+ */
 bool publisher_self_check() {
     /*
      * 最小启动自检：构造 SPS、PPS、IDR，期望解析器只返回前两个 NAL。
@@ -126,12 +171,28 @@ bool publisher_self_check() {
            !parameter_sets(h264, 8, AV_CODEC_ID_H264).complete(AV_CODEC_ID_H264);
 }
 
+/**
+ * @brief 读取 video.N 整数配置。
+ *
+ * @param[in] id 媒体通道编号。
+ * @param[in] field INI 配置字段名。
+ * @param[in] fallback 配置项不存在时使用的缺省值。
+ *
+ * @return 配置值或 fallback。
+ */
 int video_value(int id, const char *field, int fallback) {
     char key[64];
     snprintf(key, sizeof(key), "video.%d:%s", id, field);
     return rk_param_get_int(key, fallback);
 }
 
+/**
+ * @brief 转发 FFmpeg 警告和错误。
+ *
+ * @param[in] level 日志等级。
+ * @param[in] fmt FFmpeg 日志格式字符串。
+ * @param[in] args FFmpeg 日志可变参数列表。
+ */
 void ffmpeg_log(void *, int level, const char *fmt, va_list args) {
     /* FFmpeg debug/info 输出量很大；正常状态由本模块记录，只转发警告和错误。 */
     if (level > AV_LOG_WARNING)
@@ -158,9 +219,27 @@ struct EndpointConfig {
 
 class Output final {
 public:
+    /**
+     * @brief 保存一个网络端点配置。
+     *
+     * @param[in] config 网络推流端点配置。
+     */
     explicit Output(EndpointConfig config) : config_(std::move(config)) {}
+    /**
+     * @brief 关闭网络输出并释放 FFmpeg 上下文。
+     */
     ~Output() { close(); }
 
+    /**
+     * @brief 缓存参数集、按需建连并写入视频。
+     *
+     * @param[in] data 待处理数据的首地址。
+     * @param[in] size 待处理数据的字节数。
+     * @param[in] pts_us Rockchip 硬件产生的微秒时间戳。
+     * @param[in] key 是否为视频关键帧。
+     *
+     * @return 0 表示成功或等待，-1 表示失败。
+     */
     int write_video(const void *data, size_t size, uint64_t pts_us, bool key) {
         /*
          * 同一 Output 会分别收到视频线程和音频线程调用，必须串行访问
@@ -195,6 +274,15 @@ public:
                             video_value(config_.stream_id, "dst_frame_rate_den", 1));
     }
 
+    /**
+     * @brief 在端点就绪后写入 G711A 音频。
+     *
+     * @param[in] data 待处理数据的首地址。
+     * @param[in] size 待处理数据的字节数。
+     * @param[in] pts_us Rockchip 硬件产生的微秒时间戳。
+     *
+     * @return 0 表示成功或丢弃，-1 表示失败。
+     */
     int write_audio(const void *data, size_t size, uint64_t pts_us) {
         std::lock_guard<std::mutex> guard(lock_);
         /*
@@ -208,6 +296,14 @@ public:
     }
 
 private:
+    /**
+     * @brief 创建输出上下文、媒体轨并连接服务器。
+     *
+     * @param[in] first_key_size 首个视频关键帧的字节数，仅用于调试日志。
+     * @param[in] pts_us Rockchip 硬件产生的微秒时间戳。
+     *
+     * @return 0 表示成功，-1 表示失败。
+     */
     int open(size_t first_key_size, uint64_t pts_us) {
         /* 每次重连都从全新的 context 开始，旧 socket/stream 状态不能复用。 */
         close();
@@ -297,6 +393,18 @@ private:
         return 0;
     }
 
+    /**
+     * @brief 复制数据到 AVPacket、换算 PTS 并写入网络。
+     *
+     * @param[in] stream 目标 FFmpeg 媒体轨道。
+     * @param[in] data 待处理数据的首地址。
+     * @param[in] size 待处理数据的字节数。
+     * @param[in] pts_us Rockchip 硬件产生的微秒时间戳。
+     * @param[in] key 是否为视频关键帧。
+     * @param[in] duration_hint 数据包持续时间提示。
+     *
+     * @return 0 表示成功，-1 表示失败。
+     */
     int write_packet(AVStream *stream, const void *data, size_t size, uint64_t pts_us,
                      bool key, int duration_hint) {
         /*
@@ -350,18 +458,38 @@ private:
         return 0;
     }
 
+    /**
+     * @brief 记录失败原因并关闭端点。
+     *
+     * @param[in] what 失败操作的文字说明。
+     * @param[in] error FFmpeg 错误码。
+     *
+     * @return 固定返回 -1。
+     */
     int fail(const char *what, int error) {
         LOG_ERROR("%s %s: %s", config_.name.c_str(), what, error_text(error).c_str());
         close();
         return -1;
     }
 
+    /**
+     * @brief 把 FFmpeg 错误码转为文本。
+     *
+     * @param[in] error FFmpeg 错误码。
+     *
+     * @return 错误说明字符串。
+     */
     static std::string error_text(int error) {
         char text[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(error, text, sizeof(text));
         return text;
     }
 
+    /**
+     * @brief 关闭网络 IO 并释放输出上下文。
+     *
+     * @param[in] write_trailer 关闭时是否写入封装尾部。
+     */
     void close(bool write_trailer = true) {
         /* close() 可重复调用，供正常析构、打开失败和运行期断线共同使用。 */
         if (!context_)
@@ -393,6 +521,9 @@ private:
 
 class PublisherSet final {
 public:
+    /**
+     * @brief 初始化网络层并创建启用的端点。
+     */
     PublisherSet() {
         /*
          * RTSP 与 RTMP 使用不同 URL/path，因此是四个独立 publisher：
@@ -405,10 +536,24 @@ public:
         add("rtsp-ai", "stream:enable_rtsp", "stream:rtsp_ai_url", "rtsp", 1, false);
         add("rtmp-ai", "stream:enable_rtmp", "stream:rtmp_ai_url", "flv", 1, false);
     }
+    /**
+     * @brief 销毁端点并反初始化网络层。
+     */
     ~PublisherSet() {
         outputs_.clear();
         avformat_network_deinit();
     }
+    /**
+     * @brief 把视频扇出到同通道的所有端点。
+     *
+     * @param[in] id 媒体通道编号。
+     * @param[in] data 待处理数据的首地址。
+     * @param[in] size 待处理数据的字节数。
+     * @param[in] pts Rockchip 硬件产生的微秒时间戳。
+     * @param[in] key 是否为视频关键帧。
+     *
+     * @return 端点结果的按位或，0 表示均成功。
+     */
     int video(int id, const void *data, size_t size, uint64_t pts, bool key) {
         /* 一次 VENC 取流扇出给该 stream_id 的所有已启用协议端点。 */
         int ret = 0;
@@ -417,6 +562,15 @@ public:
                 ret |= output.second->write_video(data, size, pts, key);
         return ret;
     }
+    /**
+     * @brief 把音频扇出到所有主码流端点。
+     *
+     * @param[in] data 待处理数据的首地址。
+     * @param[in] size 待处理数据的字节数。
+     * @param[in] pts Rockchip 硬件产生的微秒时间戳。
+     *
+     * @return 端点结果的按位或，0 表示均成功。
+     */
     int audio(const void *data, size_t size, uint64_t pts) {
         /* 只有 stream_id=0 的主码流端点接收音频。 */
         int ret = 0;
@@ -427,6 +581,16 @@ public:
     }
 
 private:
+    /**
+     * @brief 根据 INI 开关和 URL 添加端点。
+     *
+     * @param[in] name 名称或配置字段名。
+     * @param[in] enable_key 控制端点是否启用的 INI 键。
+     * @param[in] url_key 保存推流地址的 INI 键。
+     * @param[in] format FFmpeg 输出封装格式。
+     * @param[in] id 媒体通道编号。
+     * @param[in] audio 端点是否包含音频轨道。
+     */
     void add(const char *name, const char *enable_key, const char *url_key,
              const char *format, int id, bool audio) {
         if (!rk_param_get_int(enable_key, 0))
@@ -445,6 +609,11 @@ std::mutex g_publishers_lock;
 
 } // namespace
 
+/**
+ * @brief 校验配置并创建全局推流集合。
+ *
+ * @return 0 表示成功，-1 表示失败。
+ */
 extern "C" int ffmpeg_publisher_init(void) {
     std::lock_guard<std::mutex> guard(g_publishers_lock);
     if (g_publishers)
@@ -496,16 +665,39 @@ extern "C" int ffmpeg_publisher_init(void) {
     return 0;
 }
 
+/**
+ * @brief 销毁全局推流集合。
+ */
 extern "C" void ffmpeg_publisher_deinit(void) {
     std::lock_guard<std::mutex> guard(g_publishers_lock);
     g_publishers.reset();
 }
 
+/**
+ * @brief 把一帧视频转发给全局推流集合。
+ *
+ * @param[in] id 媒体通道编号。
+ * @param[in] data 待处理数据的首地址。
+ * @param[in] size 待处理数据的字节数。
+ * @param[in] pts Rockchip 硬件产生的微秒时间戳。
+ * @param[in] key 是否为视频关键帧。
+ *
+ * @return 集合处理结果；未初始化时返回 -1。
+ */
 extern "C" int ffmpeg_publisher_write_video(int id, const void *data, size_t size,
                                               uint64_t pts, int key) {
     return g_publishers ? g_publishers->video(id, data, size, pts, key != 0) : -1;
 }
 
+/**
+ * @brief 把音频转发给全局推流集合。
+ *
+ * @param[in] data 待处理数据的首地址。
+ * @param[in] size 待处理数据的字节数。
+ * @param[in] pts Rockchip 硬件产生的微秒时间戳。
+ *
+ * @return 集合处理结果；未初始化时返回 -1。
+ */
 extern "C" int ffmpeg_publisher_write_audio(const void *data, size_t size, uint64_t pts) {
     return g_publishers ? g_publishers->audio(data, size, pts) : -1;
 }

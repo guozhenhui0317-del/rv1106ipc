@@ -26,6 +26,11 @@ namespace {
 /* 信号处理函数只能安全修改 sig_atomic_t，实际资源释放留给主线程完成。 */
 volatile sig_atomic_t g_running = 1;
 
+/**
+ * @brief 记录退出信号，让主循环安全结束。
+ *
+ * @details 参数：信号编号未使用，所有已注册退出信号执行相同处理。
+ */
 void on_signal(int) { g_running = 0; }
 
 /*
@@ -34,10 +39,20 @@ void on_signal(int) { g_running = 0; }
  */
 class Parameters final {
 public:
+    /**
+     * @brief 加载指定 INI 并建立全局参数字典。
+     *
+     * @param[in] path 文件路径。
+     *
+     * @throws std::runtime_error 初始化或 SDK 操作失败。
+     */
     explicit Parameters(std::string path) : path_(std::move(path)) {
         if (rk_param_init(&path_[0]) != 0)
             throw std::runtime_error("cannot load ini file: " + path_);
     }
+    /**
+     * @brief 销毁全局参数字典。
+     */
     ~Parameters() { rk_param_deinit(); }
     Parameters(const Parameters &) = delete;
     Parameters &operator=(const Parameters &) = delete;
@@ -45,6 +60,11 @@ private:
     std::string path_;
 };
 
+/**
+ * @brief 向标准错误输出命令行使用说明。
+ *
+ * @param[in] program 当前可执行程序名称。
+ */
 void usage(const char *program) {
     fprintf(stderr,
             "Usage: %s [-c ini] [-a iq_directory] [-l 0..3]\n"
@@ -55,6 +75,14 @@ void usage(const char *program) {
 }
 } // namespace
 
+/**
+ * @brief 解析参数，装配日志、INI 和媒体运行时，并等待退出信号。
+ *
+ * @param[in] argc 命令行参数数量。
+ * @param[in] argv 命令行参数字符串数组。
+ *
+ * @return 0 表示正常结束，1 表示启动异常，2 表示参数错误。
+ */
 int main(int argc, char **argv) {
     /* 命令行只覆盖部署环境中最常变化的路径和日志等级，其余全部由 INI 管理。 */
     std::string ini = "/oem/usr/share/rv1106_sc3336.ini";

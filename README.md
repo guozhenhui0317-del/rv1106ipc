@@ -5,8 +5,8 @@ the unrelated display, web server, storage, JPEG and legacy streaming modules.
 
 The bundled `common` directory is the complete local subset required by this program. Moving only
 the whole `gzh_ipc` directory to Linux does not require the original RKIPC repository. Rockchip SDK
-and FFmpeg 4.x remain external dependencies supplied through CMake paths. EasyLogger is pinned
-as a Git submodule under `third_party/EasyLogger`.
+and FFmpeg 4.x remain external dependencies supplied through CMake paths. The minimal EasyLogger
+core used by this program is included as the `common/easylogger` module.
 
 ## Pipeline
 
@@ -38,12 +38,12 @@ Supply target builds of:
   ISP source.
 - FFmpeg 4.x shared or static libraries built with networking, the RTSP and FLV muxers, and the
   RTSP/RTP/TCP/UDP/RTMP protocols.
-- The SC3336 IQ files and official VQE JSON file. Official RockIVA model files are required only
-  when `video.source:enable_npu=1`; the supplied INI keeps RockIVA disabled until models are deployed.
+- The SC3336 IQ files and official VQE JSON file. The supplied INI enables RockIVA, so deploy
+  `object_detection_pfp.data` to the configured `rockiva:model_path` (`/usr/lib/` by default).
 
 The CMake file documents every linked library and checks the important external headers during
-configuration. Clone with `--recurse-submodules`, or run `git submodule update --init` once before
-building. Override `ROCKCHIP_INCLUDE_DIR`, `ROCKCHIP_SYSUTILS_INCLUDE_DIR` and
+configuration. EasyLogger is already included in the source tree and does not require submodule
+initialization. Override `ROCKCHIP_INCLUDE_DIR`, `ROCKCHIP_SYSUTILS_INCLUDE_DIR` and
 `ROCKCHIP_LIB_DIR` if the SDK is not staged below `ROCKCHIP_SDK_ROOT/usr`. Do not copy target
 libraries into this source tree; keeping them outside prevents accidentally linking host libraries.
 
@@ -72,7 +72,7 @@ If necessary, add explicit overrides:
 ## PC and board setup
 
 1. Run MediaMTX on the wired PC with its default RTSP port `8554` and RTMP port `1935`.
-2. Edit all four URLs in `rv1106_sc3336.ini`, replacing `192.168.0.100` with the PC address.
+2. Edit all four URLs in `rv1106_sc3336.ini`, replacing `192.168.0.101` with the PC address.
 3. Copy the executable to `/root/gzh_ipc` and the INI to the board, plus any shared libraries not already in the image.
 4. Ensure the model directory, IQ directory and VQE JSON paths match the INI.
 5. Start:
@@ -91,10 +91,10 @@ MPI binding, thread, channel, publisher, RockIVA handle and ISP context is relea
 Open these in VLC:
 
 ```text
-rtsp://192.168.0.100:8554/main_rtsp  (main video + G711A audio)
-rtsp://192.168.0.100:8554/ai_rtsp    (AI video, boxes appear when RockIVA is enabled)
-rtmp://192.168.0.100:1935/main_rtmp  (main video + G711A audio)
-rtmp://192.168.0.100:1935/ai_rtmp    (AI video, boxes appear when RockIVA is enabled)
+rtsp://192.168.0.101:8554/main_rtsp  (main video + G711A audio)
+rtsp://192.168.0.101:8554/ai_rtsp    (AI video with RockIVA boxes)
+rtmp://192.168.0.101:1935/main_rtmp  (main video + G711A audio)
+rtmp://192.168.0.101:1935/ai_rtmp    (AI video with RockIVA boxes)
 ```
 
 The RTSP and RTMP publishers intentionally use different MediaMTX paths. A path accepts one active
