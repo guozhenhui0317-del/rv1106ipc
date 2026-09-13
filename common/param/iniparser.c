@@ -791,7 +791,7 @@ dictionary *iniparser_load(const char *ininame) {
 			break;
 		}
 	}
-	if (errs) {
+	if (errs || mem_err < 0 || ferror(in) || last) {
 		dictionary_del(dict);
 		dict = NULL;
 	}

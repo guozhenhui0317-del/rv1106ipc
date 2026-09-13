@@ -37,7 +37,12 @@ set(APP_SOURCES
   src/logger.cpp
   src/elog_port.c
   src/ffmpeg_publisher.cpp
+  src/annexb.cpp
   src/media.cpp
+  src/video.cpp
+  src/audio.cpp
+  src/network_route.cpp
+  src/fps_overlay.cpp
   common/common.c
   common/param/dictionary.c
   common/param/iniparser.c

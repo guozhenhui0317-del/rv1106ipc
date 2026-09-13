@@ -8,6 +8,7 @@
 #undef LOG_TAG
 #endif
 #define LOG_TAG "rockiva.c"
+#include "frame_wait.h"
 
 pthread_mutex_t g_rknn_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 RockIvaHandle rkba_handle;
@@ -356,7 +357,7 @@ int rkipc_rockiva_write_rgb888_frame(uint16_t width, uint16_t height, uint32_t f
 	image->frameId = frame_id;
 	ret = ROCKIVA_PushFrame(rkba_handle, image, NULL);
 	if (ret == 0)
-		rk_signal_wait(rockiva_signal, 10000);
+		rkipc_wait_frame_release(rockiva_signal);
 	else
 		LOG_ERROR("ROCKIVA_PushFrame fail, ret is %d\n", ret);
 	free(image);
@@ -383,7 +384,7 @@ int rkipc_rockiva_write_rgb888_frame_by_fd(uint16_t width, uint16_t height, uint
 	image->dataFd = fd;
 	ret = ROCKIVA_PushFrame(rkba_handle, image, NULL);
 	if (ret == 0)
-		rk_signal_wait(rockiva_signal, 10000);
+		rkipc_wait_frame_release(rockiva_signal);
 	else
 		LOG_ERROR("ROCKIVA_PushFrame fail, ret is %d\n", ret);
 	free(image);
@@ -422,7 +423,7 @@ int rkipc_rockiva_write_nv12_frame_by_fd(uint16_t width, uint16_t height, uint32
 	image->dataFd = fd;
 	ret = ROCKIVA_PushFrame(rkba_handle, image, NULL);
 	if (ret == 0)
-		rk_signal_wait(rockiva_signal, 10000);
+		rkipc_wait_frame_release(rockiva_signal);
 	else
 		LOG_ERROR("ROCKIVA_PushFrame fail, ret is %d\n", ret);
 	free(image);
@@ -459,7 +460,7 @@ int rkipc_rockiva_write_nv12_frame_by_phy_addr(uint16_t width, uint16_t height, 
 	image->dataPhyAddr = phy_addr;
 	ret = ROCKIVA_PushFrame(rkba_handle, image, NULL);
 	if (ret == 0)
-		rk_signal_wait(rockiva_signal, 10000);
+		rkipc_wait_frame_release(rockiva_signal);
 	else
 		LOG_ERROR("ROCKIVA_PushFrame fail, ret is %d\n", ret);
 	free(image);

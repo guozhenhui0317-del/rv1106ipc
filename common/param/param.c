@@ -4,6 +4,7 @@
 #include "common.h"
 #include "iniparser.h"
 #include "log.h"
+#include <sys/stat.h>
 
 #ifdef LOG_TAG
 #undef LOG_TAG
@@ -27,6 +28,7 @@ int rk_param_dump() {
 		section_name = iniparser_getsecname(g_ini_d_, i);
 		section_keys = iniparser_getsecnkeys(g_ini_d_, section_name);
 		LOG_DEBUG("section_name is %s, section_keys is %d\n", section_name, section_keys);
+		if (section_keys > MAX_SECTION_KEYS) return -1;
 		for (int j = 0; j < section_keys; j++) {
 			iniparser_getseckeys(g_ini_d_, section_name, keys);
 			LOG_DEBUG("%s = %s\n", keys[j], iniparser_getstring(g_ini_d_, keys[j], ""));
@@ -36,20 +38,48 @@ int rk_param_dump() {
 	return 0;
 }
 
+/**
+ * @brief 显式保存配置：同目录临时文件写入成功后原子替换，不在退出时自动调用。
+ * @return 0 成功；-1 失败。重命名前失败不改变原文件或内存字典。
+ * @details fsync 用于显式持久化；目录同步失败时新文件可能已可见，不保证断电持久性。
+ */
 int rk_param_save() {
-	FILE *fp = fopen(g_ini_path_, "w");
-	if (fp == NULL) {
-		LOG_ERROR("%s, fopen error!\n", g_ini_path_);
-		iniparser_freedict(g_ini_d_);
-		g_ini_d_ = NULL;
-		return -1;
-	}
-	iniparser_dump_ini(g_ini_d_, fp);
-
-	fflush(fp);
-	fclose(fp);
-
-	return 0;
+    char temporary[280], parent[256];
+    struct stat st;
+    int result = -1, fd = -1, directory = -1;
+    FILE *fp = NULL;
+    temporary[0] = 0;
+    pthread_mutex_lock(&g_param_mutex);
+    if (!g_ini_d_ || lstat(g_ini_path_, &st) != 0 || !S_ISREG(st.st_mode))
+        goto done;
+    snprintf(parent, sizeof(parent), "%s", g_ini_path_);
+    char *slash = strrchr(parent, '/');
+    if (!slash) strcpy(parent, ".");
+    else if (slash == parent) slash[1] = 0;
+    else *slash = 0;
+    directory = open(parent, O_RDONLY | O_DIRECTORY);
+    if (directory < 0) goto done;
+    snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", g_ini_path_);
+    fd = mkstemp(temporary);
+    if (fd < 0) { temporary[0] = 0; goto done; }
+    if (fchmod(fd, st.st_mode & 0777) != 0) goto done;
+    fp = fdopen(fd, "w");
+    if (!fp) goto done;
+    fd = -1; /* FILE 接管描述符。 */
+    iniparser_dump_ini(g_ini_d_, fp);
+    if (ferror(fp) || fflush(fp) != 0 || fsync(fileno(fp)) != 0) goto done;
+    if (fclose(fp) != 0) { fp = NULL; goto done; }
+    fp = NULL;
+    if (rename(temporary, g_ini_path_) != 0) goto done;
+    temporary[0] = 0;
+    if (fsync(directory) == 0) result = 0;
+done:
+    if (fp) fclose(fp);
+    if (fd >= 0) close(fd);
+    if (temporary[0]) unlink(temporary);
+    if (directory >= 0) close(directory);
+    pthread_mutex_unlock(&g_param_mutex);
+    return result;
 }
 
 int rk_param_get_int(const char *entry, int default_val) {
@@ -71,13 +101,13 @@ int rk_param_get_double(const char *entry, double default_val) {
 }
 
 int rk_param_set_int(const char *entry, int val) {
-	char tmp[8];
-	sprintf(tmp, "%d", val);
+	char tmp[32];
+	snprintf(tmp, sizeof(tmp), "%d", val);
 	pthread_mutex_lock(&g_param_mutex);
-	iniparser_set(g_ini_d_, entry, tmp);
+	int ret = iniparser_set(g_ini_d_, entry, tmp);
 	pthread_mutex_unlock(&g_param_mutex);
 
-	return 0;
+	return ret;
 }
 
 const char *rk_param_get_string(const char *entry, const char *default_val) {
@@ -91,68 +121,48 @@ const char *rk_param_get_string(const char *entry, const char *default_val) {
 
 int rk_param_set_string(const char *entry, const char *val) {
 	pthread_mutex_lock(&g_param_mutex);
-	iniparser_set(g_ini_d_, entry, val);
+	int ret = iniparser_set(g_ini_d_, entry, val);
 	pthread_mutex_unlock(&g_param_mutex);
 
-	return 0;
+	return ret;
 }
 
+/** @brief 加载 INI，不覆盖损坏文件或静默恢复出厂配置。
+ * @param ini_path 路径；NULL 使用官方默认路径。
+ * @return 0 成功，-1 路径过长、重复初始化或解析失败。
+ */
 int rk_param_init(char *ini_path) {
-	LOG_DEBUG("%s\n", __func__);
-	char cmd[256];
-	pthread_mutex_lock(&g_param_mutex);  // 互斥锁
-	g_ini_d_ = NULL;
-	if (ini_path)
-		memcpy(g_ini_path_, ini_path, strlen(ini_path));
-	else
-		memcpy(g_ini_path_, "/userdata/rkipc.ini", strlen("/userdata/rkipc.ini"));
-	LOG_INFO("g_ini_path_ is %s\n", g_ini_path_);
-
-	g_ini_d_ = iniparser_load(g_ini_path_);
-	if (g_ini_d_ == NULL) {
-		LOG_ERROR("iniparser_load %s error! use /tmp/rkipc-factory-config.ini\n", g_ini_path_);
-		snprintf(cmd, 127, "cp /tmp/rkipc-factory-config.ini %s", g_ini_path_); // 解析ini文件失败就使用用/tmp/rkipc-factory-config.ini重新解析
-		LOG_INFO("cmd is %s\n", cmd);
-		system(cmd);
-		g_ini_d_ = iniparser_load(g_ini_path_);
-		if (g_ini_d_ == NULL) {
-			LOG_ERROR("iniparser_load error again!\n");
-			pthread_mutex_unlock(&g_param_mutex);
-			return -1;
-		}
-	}
-	rk_param_dump();
-	pthread_mutex_unlock(&g_param_mutex);
-
-	return 0;
+    const char *path = ini_path ? ini_path : "/userdata/rkipc.ini";
+    if (!path[0] || strlen(path) >= sizeof(g_ini_path_)) return -1;
+    pthread_mutex_lock(&g_param_mutex);
+    if (g_ini_d_) { pthread_mutex_unlock(&g_param_mutex); return -1; }
+    dictionary *loaded = iniparser_load(path);
+    if (!loaded) { pthread_mutex_unlock(&g_param_mutex); return -1; }
+    snprintf(g_ini_path_, sizeof(g_ini_path_), "%s", path);
+    g_ini_d_ = loaded;
+    pthread_mutex_unlock(&g_param_mutex);
+    return 0;
 }
 
+/** @brief 释放内存配置，绝不隐式写盘。@return 0。 */
 int rk_param_deinit() {
-	LOG_INFO("%s\n", __func__);
-	if (g_ini_d_ == NULL)
-		return 0;
-	pthread_mutex_lock(&g_param_mutex);
-	rk_param_save();
-	if (g_ini_d_)
-		iniparser_freedict(g_ini_d_);
-	pthread_mutex_unlock(&g_param_mutex);
-
-	return 0;
+    pthread_mutex_lock(&g_param_mutex);
+    if (g_ini_d_) iniparser_freedict(g_ini_d_);
+    g_ini_d_ = NULL;
+    pthread_mutex_unlock(&g_param_mutex);
+    return 0;
 }
 
+/** @brief 解析成功才替换字典；失败保留当前配置。
+ * @return 0 成功，-1 未初始化或解析失败。
+ * @details 仅在无读者持有字符串指针时调用；不是媒体运行时热更新接口。
+ */
 int rk_param_reload() {
-	LOG_INFO("%s\n", __func__);
-	pthread_mutex_lock(&g_param_mutex);
-	if (g_ini_d_)
-		iniparser_freedict(g_ini_d_);
-	g_ini_d_ = iniparser_load(g_ini_path_);
-	if (g_ini_d_ == NULL) {
-		LOG_ERROR("iniparser_load error!\n");
-		pthread_mutex_unlock(&g_param_mutex);
-		return -1;
-	}
-	rk_param_dump();
-	pthread_mutex_unlock(&g_param_mutex);
-
-	return 0;
+    pthread_mutex_lock(&g_param_mutex);
+    dictionary *loaded = g_ini_d_ ? iniparser_load(g_ini_path_) : NULL;
+    if (!loaded) { pthread_mutex_unlock(&g_param_mutex); return -1; }
+    iniparser_freedict(g_ini_d_);
+    g_ini_d_ = loaded;
+    pthread_mutex_unlock(&g_param_mutex);
+    return 0;
 }

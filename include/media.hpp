@@ -8,7 +8,7 @@
  * 整条音视频硬件链路的 RAII 入口。
  *
  * 构造顺序：ISP -> RockIVA -> RK MPI -> FFmpeg publisher -> Video -> Audio。
- * 任一步失败都会回滚已经成功的资源；析构时严格按相反顺序释放。
+ * 任一步失败都会回滚已取得的资源；析构按媒体依赖及官方 RV1106 顺序释放。
  * MediaPipeline 隐藏 Rockchip SDK 类型，使使用方只需要包含这个轻量头文件。
  */
 class MediaRuntime final {
@@ -20,7 +20,7 @@ public:
      *
      * @throws std::runtime_error 初始化或 SDK 操作失败。
      */
-    explicit MediaRuntime(const std::string &iq_file_dir);
+    explicit MediaRuntime(const std::string &iq_file_dir);  // 构造函数禁止隐式转换
     /**
      * @brief 停止并释放完整媒体链路。
      */

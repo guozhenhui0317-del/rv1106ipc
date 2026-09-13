@@ -1,0 +1,268 @@
+#!/bin/sh
+# @file S98gzh_ipc
+# @brief Buildroot/BusyBox 服务入口；开机 start、关机按逆序 stop。
+# 保留 S21appinit 的驱动/网络初始化，但必须禁用其中的官方 rkipc 启动命令。
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+DAEMON=/root/gzh_ipc
+PIDFILE=/run/gzh_ipc.pid
+DESIRED=/run/gzh_ipc.desired
+RECOVERY_LOG=/root/gzh_ipc-recovery.log
+WATCHLOCK=/run/gzh_ipc.watchdog.lock
+SELF=$(readlink -f "$0")
+INI=/oem/usr/share/rv1106_sc3336.ini
+IQ=/etc/iqfiles
+export LD_LIBRARY_PATH=/root/gzh_ipc_lib:/oem/usr/lib:/usr/lib:/lib
+
+# @brief 校验 PID 文件与实际可执行文件，避免向已复用的无关 PID 发信号。
+# @return 0 表示本服务进程存在，1 表示不存在；设置 pid 和 state。
+running() {
+    pid= state= heartbeat=
+    [ -r "$PIDFILE" ] && read -r pid state heartbeat < "$PIDFILE"
+    case "$pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+    [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$DAEMON" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+# @brief 等待应用明确报告媒体初始化成功，而非只检查后台进程是否创建。
+# @return 0 表示 ready，1 表示退出、停止中或初始化超时。
+wait_ready() {
+    count=0
+    while [ "$count" -lt 30 ]; do
+        if running; then
+            case "$state" in
+                ready) echo "gzh_ipc ready (PID $pid); publishing may still await network/key frame"; return 0 ;;
+                stopping) echo "gzh_ipc is stopping; retry after it exits"; return 1 ;;
+            esac
+        elif [ "$count" -ge 2 ]; then
+            echo "gzh_ipc failed to start; inspect /root/rkipc.log"
+            return 1
+        fi
+        count=$((count + 1))
+        sleep 1
+    done
+    echo "gzh_ipc initialization timed out; not killed. Check status/logs or use stop"
+    return 1
+}
+
+# @brief 校验环境，等待驱动，再启动程序；重复 start 不创建第二份。
+# @return 0 表示已就绪，1 表示前置条件或初始化失败。
+start_service() {
+    if running; then wait_ready; return $?; fi
+    if pidof rkipc >/dev/null; then
+        echo "official rkipc is running; stop it and disable its autostart first"
+        return 1
+    fi
+    if pidof gzh_ipc >/dev/null; then
+        echo "unmanaged/older gzh_ipc exists; stop it before starting this service"
+        return 1
+    fi
+    [ -x "$DAEMON" ] && [ -r "$INI" ] && [ -d "$IQ" ] || {
+        echo "missing executable, INI or IQ directory"; return 1;
+    }
+    "$DAEMON" -h >/dev/null 2>&1 || { echo "cannot load gzh_ipc; check target libraries"; return 1; }
+    "$DAEMON" -t -c "$INI" || { echo "invalid configuration; hardware was not started"; return 1; }
+    count=0
+    while [ ! -d /sys/module/rockit ] || [ ! -c /dev/video0 ]; do
+        [ "$count" -lt 30 ] || { echo "drivers not ready; check S21appinit/insmod_ko.sh"; return 1; }
+        count=$((count + 1))
+        sleep 1
+    done
+    # 应用自己取得锁并写 PID。不能用 -m 提前写 PID，也不能把服务操作锁传给后台进程。
+    start-stop-daemon -S -b -x "$DAEMON" -- -c "$INI" -a "$IQ" 9>&- 8>&- || return 1
+    wait_ready
+}
+
+# @brief 发送 SIGTERM 并等待 RAII 释放资源；超时绝不自动 SIGKILL。
+# @return 0 表示已停止，1 表示停止失败或超时。
+stop_service() {
+    if ! running; then
+        if pidof gzh_ipc >/dev/null; then
+            echo "unmanaged/older gzh_ipc exists; refusing to guess its PID"
+            return 1
+        fi
+        echo "gzh_ipc already stopped"
+        return 0
+    fi
+    start-stop-daemon -K -s TERM -p "$PIDFILE" -x "$DAEMON" || return 1
+    count=0
+    while running; do
+        [ "$count" -lt 30 ] || { echo "gzh_ipc stop timed out; not force-killed"; return 1; }
+        count=$((count + 1))
+        sleep 1
+    done
+    echo "gzh_ipc stopped"
+}
+
+# @brief 只读报告进程/初始化状态，不把它等同于推流健康检测。
+# @return 0 表示就绪，1 表示初始化或停止中，3 表示停止，4 表示未托管进程。
+status_service() {
+    if running; then
+        echo "gzh_ipc $state (PID $pid)"
+        [ "$state" = ready ]
+    elif pidof gzh_ipc >/dev/null; then
+        echo "unmanaged/older gzh_ipc process found"
+        return 4
+    else
+        echo "gzh_ipc stopped"
+        return 3
+    fi
+}
+
+
+# @brief 读取启动意图；只有显式 start/restart 才重新启用已熔断的恢复。
+# @return 0 表示允许恢复，1 表示用户停止或故障熔断。
+wanted() {
+    intent= token=
+    [ -r "$DESIRED" ] && read -r intent token < "$DESIRED"
+    [ "$intent" = run ]
+}
+
+# @brief 轮转独立恢复日志，最多两份各 256 KiB，不与 EasyLogger 共用文件。
+# @param $* 事件文字，最多保存 4096 字节。@return 0 成功，1 写入或轮转失败。
+# @details 仅由持有 WATCHLOCK 的监控进程调用；失败后本进程不再尝试写盘。
+recovery_log() {
+    [ "${recovery_log_failed:-0}" = 0 ] || return 1
+    log_size=0
+    if [ -e "$RECOVERY_LOG" ]; then
+        log_size=$(wc -c < "$RECOVERY_LOG") || log_size=invalid
+    fi
+    case "$log_size" in ''|*[!0-9]*) recovery_log_failed=1; return 1 ;; esac
+    if [ "$log_size" -gt 257944 ]; then
+        mv -f "$RECOVERY_LOG" "$RECOVERY_LOG.1" || {
+            recovery_log_failed=1; return 1;
+        }
+    fi
+    if ! LC_ALL=C printf '%s [recovery] %.4096s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$RECOVERY_LOG"; then
+        recovery_log_failed=1
+        return 1
+    fi
+}
+
+# @brief 熔断自动恢复，不强杀、不重启设备。@param $* 原因。@return 无业务返回值。
+block_recovery() {
+    printf 'blocked %s\n' "$token" > "$DESIRED"
+    recovery_log "blocked: $*; inspect logs, then use explicit start/restart"
+}
+
+# @brief 检测一轮进程/心跳；调用者必须持有服务操作锁。
+# @return 无业务返回值；所有恢复受人工启动意图和三次预算限制。
+monitor_tick() {
+    if ! wanted; then return; fi
+    read -r uptime_rest ignored < /proc/uptime
+    now=${uptime_rest%%.*}
+    if [ "$token" != "$observed_token" ]; then
+        observed_token=$token; attempts=0; next_try=0; healthy_since=0; healthy_pid=
+    fi
+    if running; then
+        case "$heartbeat" in
+            ''|*[!0-9]*) block_recovery "missing monotonic heartbeat (old executable?)"; return ;;
+        esac
+        age=$((now - heartbeat))
+        if [ "$state" = ready ] && [ "$age" -lt 60 ]; then
+            if [ "$healthy_pid" != "$pid" ]; then healthy_pid=$pid; healthy_since=$now; fi
+            # 只有连续健康五分钟才重置失败预算，避免刚启动成功便无限重试。
+            if [ $((now - healthy_since)) -ge 300 ]; then attempts=0; fi
+            next_try=0
+            return
+        fi
+        healthy_since=0; healthy_pid=
+        case "$state" in
+            starting) [ "$age" -lt 60 ] && return ;;
+            stopping) [ "$age" -lt 30 ] && return ;;
+            ready) ;;
+            *) block_recovery "invalid process state $state"; return ;;
+        esac
+        recovery_log "PID $pid state=$state heartbeat_age=${age}s; requesting SIGTERM"
+        if ! stop_service >/dev/null 2>&1; then
+            block_recovery "graceful stop failed; no force-kill or overlapping restart"
+            return
+        fi
+    fi
+    healthy_since=0; healthy_pid=
+    if pidof gzh_ipc >/dev/null || pidof rkipc >/dev/null; then
+        block_recovery "unmanaged or conflicting IPC process still exists"
+        return
+    fi
+    if [ "$attempts" -ge 3 ]; then block_recovery "three recovery attempts exhausted"; return; fi
+    if [ "$next_try" -eq 0 ]; then
+        delay=$((10 * (attempts + 1)))
+        next_try=$((now + delay))
+        recovery_log "process absent; retry $((attempts + 1))/3 in ${delay}s"
+        return
+    fi
+    [ "$now" -lt "$next_try" ] && return
+    attempts=$((attempts + 1)); next_try=0
+    recovery_log "automatic start attempt $attempts/3"
+    if start_service >/dev/null 2>&1; then
+        recovery_log "automatic start ready"
+    else
+        recovery_log "start not ready; checking again next cycle"
+    fi
+}
+
+# @brief 运行唯一后台检测循环；每五秒检查，绝不继承给媒体进程锁 FD。
+# @return 循环异常结束时返回非零；重复检测器直接退出成功。
+monitor_loop() {
+    exec 8>"$WATCHLOCK"
+    flock -n 8 || return 0
+    observed_token= attempts=0 next_try=0 healthy_since=0 healthy_pid=
+    recovery_log "monitor started"
+    while :; do
+        exec 9>/run/gzh_ipc.service.lock
+        if flock -n 9; then
+            monitor_tick
+            flock -u 9
+        fi
+        exec 9>&-
+        sleep 5
+    done
+}
+
+# @brief 确保后台检测器存在。@return 0 成功，非零表示启动失败。
+ensure_monitor() {
+    if (flock -n 8) 8>"$WATCHLOCK"; then
+        start-stop-daemon -S -b -x "$SELF" -- _monitor 9>&- 8>&-
+    fi
+}
+
+case "${1:-}" in
+    status)
+        status_service; result=$?
+        intent= token=
+        [ -r "$DESIRED" ] && read -r intent token < "$DESIRED"
+        echo "automatic recovery: ${intent:-off}"
+        [ "$intent" = blocked ] && result=1
+        if [ "$intent" = run ]; then
+            if [ ! -f "$WATCHLOCK" ] || (flock -n 8) 8<"$WATCHLOCK"; then
+                echo "WARNING: recovery monitor is not running"; result=1
+            fi
+        fi
+        exit "$result" ;;
+    start|stop|restart|_monitor) ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 2 ;;
+esac
+[ "$(id -u)" = 0 ] || { echo "run this service as root"; exit 1; }
+command -v flock >/dev/null && command -v start-stop-daemon >/dev/null || {
+    echo "BusyBox flock/start-stop-daemon required"; exit 1;
+}
+[ "${1:-}" = _monitor ] && { monitor_loop; exit $?; }
+# 串行执行 start/stop/restart；不可删除锁文件，以免并发调用锁住不同 inode。
+exec 9>/run/gzh_ipc.service.lock
+flock -n 9 || { echo "another service operation is in progress"; exit 1; }
+case "$1" in
+    start)
+        printf 'run %s\n' "$$" > "$DESIRED"
+        ensure_monitor || exit 1
+        start_service ;;
+    stop)
+        printf 'off %s\n' "$$" > "$DESIRED"
+        stop_service ;;
+    restart)
+        printf 'off %s\n' "$$" > "$DESIRED"
+        stop_service || exit 1
+        printf 'run %s\n' "$$" > "$DESIRED"
+        ensure_monitor || exit 1
+        start_service ;;
+esac

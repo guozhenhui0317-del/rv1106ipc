@@ -1,6 +1,10 @@
 #include "logger.hpp"
 #include "log.h"
 #include "media.hpp"
+#include "service_state.hpp"
+#include "media_health.hpp"
+#include "config_validation.hpp"
+#include <memory>
 
 extern "C" {
 #include "param.h"
@@ -67,7 +71,8 @@ private:
  */
 void usage(const char *program) {
     fprintf(stderr,
-            "Usage: %s [-c ini] [-a iq_directory] [-l 0..3]\n"
+            "Usage: %s [-c ini] [-a iq_directory] [-l 0..3] [-t]\n"
+            "  -t  validate INI only; no hardware, network or file writes\n"
             "  -c  default /oem/usr/share/rv1106_sc3336.ini\n"
             "  -a  default /etc/iqfiles\n"
             "  -l  override ini log level: error=0 warn=1 info=2 debug=3\n",
@@ -88,16 +93,23 @@ int main(int argc, char **argv) {
     std::string ini = "/oem/usr/share/rv1106_sc3336.ini";
     std::string iq = "/etc/iqfiles";
     int level_override = -1;
+    bool check_only = false;
     int option;
-    while ((option = getopt(argc, argv, "c:a:l:h")) != -1) {
+    while ((option = getopt(argc, argv, "c:a:l:ht")) != -1) {
         switch (option) {
         case 'c': ini = optarg; break;
         case 'a': iq = optarg; break;
-        case 'l': level_override = atoi(optarg); break;
+        case 'l':
+            try { level_override = config::integer(optarg, "-l", 0, 3); }
+            catch (const std::exception &error) { fprintf(stderr, "%s\n", error.what()); return 2; }
+            break;
+        case 't': check_only = true; break;
         case 'h': usage(argv[0]); return 0;
         default: usage(argv[0]); return 2;
         }
     }
+
+    if (optind != argc || ini.empty() || ini.size() >= 256 || iq.empty()) { usage(argv[0]); return 2; }
 
     /* 忽略 SIGPIPE：网络断开应交给 FFmpeg 返回错误并重连，而不是杀死进程。 */
     signal(SIGINT, on_signal);
@@ -105,20 +117,43 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     try {
+        if (check_only) {
+            // 不初始化 Logger/ServiceState，运行中的服务也可执行只读预检。
+            std::unique_ptr<dictionary, decltype(&iniparser_freedict)> parsed(
+                iniparser_load(ini.c_str()), &iniparser_freedict);
+            config::validate(parsed.get());
+            puts("configuration valid (syntax and core parameters; SDK/assets not checked)");
+            return 0;
+        }
         /*
          * 局部对象按声明的相反顺序析构：MediaRuntime 先停采集和推流，
          * Parameters 再销毁配置字典，最后 Logger 关闭日志文件。
          */
+        // 最先取得单实例锁，最后释放：重复启动不会触碰配置、摄像头或日志。
+        ServiceState service;
         Logger logger("/root/rkipc.log");
         Parameters parameters(ini);
+        config::validate(g_ini_d_); // 必须早于任何 ISP/MPI/IVA 和网络初始化。
         logger.configure(level_override >= 0 ? level_override
                                              : rk_param_get_int("log:level", 2));
         LOG_INFO("starting with ini=%s iq=%s", ini.c_str(), iq.c_str());
-        MediaRuntime media(iq);
-        while (g_running)
+        MediaHealth::instance().reset(rk_param_get_int("audio.0:enable", 1) != 0,
+                                      rk_param_get_int("video.source:enable_npu", 1) != 0);
+        MediaRuntime media(iq);  // 实例化MediaRuntime类，并传入iq file路径
+        service.set("ready"); // 媒体初始化完成；网络发布仍可能等待接收端和关键帧。
+        int exit_code = 0;
+        while (g_running) {
+            service.set("ready"); // /run 中的单调时钟心跳，不写入闪存。
+            if (const char *channel = MediaHealth::instance().stalled()) {
+                LOG_ERROR("health: %s has no progress for 60 seconds; requesting graceful recovery", channel);
+                exit_code = 1;
+                break;
+            }
             sleep(1);
+        }
+        service.set("stopping");
         LOG_INFO("shutdown requested");
-        return 0;
+        return exit_code;
     } catch (const std::exception &error) {
         /* Logger 自身可能构造失败，因此兜底错误必须直接写 stderr。 */
         fprintf(stderr, "gzh_ipc: startup failed: %s\n", error.what());
