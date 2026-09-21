@@ -1,7 +1,7 @@
 #include "ffmpeg_publisher.h"
-#include "annexb.hpp"
-#include "network_route.hpp"
-#include "publisher_queue.hpp"
+#include "publisher/annexb.hpp"
+#include "network/network_route.hpp"
+#include "publisher/publisher_queue.hpp"
 #include <array>
 #include <thread>
 #include <sys/prctl.h>

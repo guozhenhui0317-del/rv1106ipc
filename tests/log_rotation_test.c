@@ -3,7 +3,7 @@
  */
 #include <assert.h>
 #include <stdlib.h>
-#include "../src/elog_port.c"
+#include "../src/logging/elog_port.c"
 
 /** @brief 检查文件大小及首字节。@param path 路径。@param byte 期望字符。 */
 static void check(const char *path, int byte) {

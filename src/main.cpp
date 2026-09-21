@@ -1,9 +1,9 @@
 #include "logger.hpp"
 #include "log.h"
 #include "media.hpp"
-#include "service_state.hpp"
-#include "media_health.hpp"
-#include "config_validation.hpp"
+#include "service/service_state.hpp"
+#include "media/media_health.hpp"
+#include "config/config_validation.hpp"
 #include <memory>
 
 extern "C" {
@@ -119,6 +119,7 @@ int main(int argc, char **argv) {
     try {
         if (check_only) {
             // 不初始化 Logger/ServiceState，运行中的服务也可执行只读预检。
+            // 创建智能指针，自动管理释放资源
             std::unique_ptr<dictionary, decltype(&iniparser_freedict)> parsed(
                 iniparser_load(ini.c_str()), &iniparser_freedict);
             config::validate(parsed.get());

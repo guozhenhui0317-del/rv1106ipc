@@ -1,7 +1,7 @@
 /** @file config_test.cpp
  * @brief 验证配置预检及持久化故障保护，仅操作主机临时目录。
  */
-#include "../src/config_validation.hpp"
+#include "../src/config/config_validation.hpp"
 extern "C" {
 #include "param.h"
 }

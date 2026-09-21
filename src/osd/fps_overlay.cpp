@@ -1,7 +1,7 @@
 #define LOG_TAG "fps"
-#include "fps_overlay.hpp"
-#include "fps_text.hpp"
-#include "media_support.hpp"
+#include "osd/fps_overlay.hpp"
+#include "osd/fps_text.hpp"
+#include "media/media_support.hpp"
 extern "C" {
 #include "rk_mpi_rgn.h"
 }

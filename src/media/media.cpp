@@ -1,8 +1,8 @@
 #define LOG_TAG "media"
 
 #include "media.hpp"
-#include "media_channels.hpp"
-#include "media_support.hpp"
+#include "media/media_channels.hpp"
+#include "media/media_support.hpp"
 #include "ffmpeg_publisher.h"
 
 extern "C" {

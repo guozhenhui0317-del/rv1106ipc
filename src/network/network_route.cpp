@@ -1,6 +1,6 @@
 #define LOG_TAG "network"
-#include "network_route.hpp"
-#include "route_identity.hpp"
+#include "network/network_route.hpp"
+#include "network/route_identity.hpp"
 #include "log.h"
 
 #include <arpa/inet.h>

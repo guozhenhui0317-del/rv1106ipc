@@ -1,4 +1,4 @@
-#include "route_identity.hpp"
+#include "network/route_identity.hpp"
 #include <cassert>
 
 /** @brief 拒绝无记录、异目标/网卡/优先级/网关的用户路由。 @return 0 表示通过。 */

@@ -1,5 +1,5 @@
-#include "network_route.hpp"
-#include "fps_text.hpp"
+#include "network/network_route.hpp"
+#include "osd/fps_text.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cstdio>

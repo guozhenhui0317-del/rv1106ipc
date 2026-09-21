@@ -1,8 +1,8 @@
 #define LOG_TAG "media"
 
-#include "media_channels.hpp"
-#include "media_support.hpp"
-#include "media_health.hpp"
+#include "media/media_channels.hpp"
+#include "media/media_support.hpp"
+#include "media/media_health.hpp"
 
 extern "C" {
 #include "param.h"

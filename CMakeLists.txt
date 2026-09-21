@@ -34,15 +34,15 @@ endforeach()
 
 set(APP_SOURCES
   src/main.cpp
-  src/logger.cpp
-  src/elog_port.c
-  src/ffmpeg_publisher.cpp
-  src/annexb.cpp
-  src/media.cpp
-  src/video.cpp
-  src/audio.cpp
-  src/network_route.cpp
-  src/fps_overlay.cpp
+  src/logging/logger.cpp
+  src/logging/elog_port.c
+  src/publisher/ffmpeg_publisher.cpp
+  src/publisher/annexb.cpp
+  src/media/media.cpp
+  src/media/video.cpp
+  src/media/audio.cpp
+  src/network/network_route.cpp
+  src/osd/fps_overlay.cpp
   common/common.c
   common/param/dictionary.c
   common/param/iniparser.c
@@ -67,6 +67,7 @@ target_compile_definitions(gzh_ipc PRIVATE ISP_HW_V32)
 target_compile_options(gzh_ipc PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 target_include_directories(gzh_ipc PRIVATE
+  src # 模块内部头文件以 media/...、publisher/... 等路径引用。
   include
   common
   common/param

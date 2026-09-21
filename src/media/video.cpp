@@ -1,9 +1,9 @@
 #define LOG_TAG "media"
 
-#include "media_channels.hpp"
-#include "media_support.hpp"
-#include "fps_overlay.hpp"
-#include "media_health.hpp"
+#include "media/media_channels.hpp"
+#include "media/media_support.hpp"
+#include "osd/fps_overlay.hpp"
+#include "media/media_health.hpp"
 
 extern "C" {
 #include "param.h"

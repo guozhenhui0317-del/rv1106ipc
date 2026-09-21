@@ -18,7 +18,15 @@ rv1106ipc/
 ├── .gitignore               排除构建产物、动态库、运行日志等
 ├── .gitattributes           统一源码与脚本使用 LF 换行
 ├── include/                 自研模块对外声明、日志配置与兼容头
-├── src/                     自研实现和仅供内部使用的轻量头文件
+├── src/                     自研实现，按功能模块组织
+│   ├── main.cpp             程序装配入口
+│   ├── media/               音视频通道、总装配、媒体健康检测
+│   ├── publisher/           FFmpeg 发送、编码包队列、参数集解析
+│   ├── network/             有线/Wi-Fi 策略与路由管理
+│   ├── osd/                 FPS 统计、字体与 RGN 画布
+│   ├── config/              配置语义校验
+│   ├── logging/             EasyLogger 封装与输出端口
+│   └── service/             单实例锁、状态与心跳
 ├── common/                  官方公共代码的最小依赖集
 │   ├── param/               dictionary → iniparser → rk_param 参数接口
 │   ├── isp/rv1106/          RKAIQ / ISP 适配
@@ -42,27 +50,32 @@ rv1106ipc/
 
 ### 1.2 `src/`：实现“模块具体怎么做”
 
+每个功能模块的 `.cpp` 和内部 `.hpp` 放在同一子目录；`include/` 只保留对外接口。
+内部引用采用 `#include "network/network_route.hpp"` 等带模块名的路径，明确依赖来源。
+CMake 仅为本程序添加 `src` 私有搜索路径，不把内部头文件作为对外接口安装。
+本次目录划分不改变线程、生命周期、通道号和设备部署路径。
+
 | 文件 | 主要对象/函数 | 作用 |
 | --- | --- | --- |
 | [main.cpp](src/main.cpp) | `main`、`Parameters`、`on_signal` | 命令行、配置加载与预检、对象装配、心跳、退出信号 |
-| [media.cpp](src/media.cpp) | `MediaRuntime::MediaPipeline` | 按依赖组织 ISP、IVA、MPI、推流、视频和音频，统一失败回滚 |
-| [media_channels.hpp](src/media_channels.hpp) | `Video`、`Audio`、`VideoSink`、`AudioSink` | 内部采集接口；通过函数指针注入输出，不依赖具体网络协议 |
-| [media_support.hpp](src/media_support.hpp) | `require_ok`、`cleanup` | 初始化错误转换为异常；记录清理前后及返回码 |
-| [video.cpp](src/video.cpp) | `Video::Impl` | VI/VENC、视频取流、IVA 旁路送帧、检测框与视频资源释放 |
-| [audio.cpp](src/audio.cpp) | `Audio::Impl` | AI/VQE/AENC 初始化、G711A 取流及音频资源释放 |
-| [ffmpeg_publisher.cpp](src/ffmpeg_publisher.cpp) | `PublisherSet`、`AsyncOutput`、`Output` | 编码包分发、独立发送线程、FFmpeg 封装、时间戳和重连 |
-| [publisher_queue.hpp](src/publisher_queue.hpp) | `publishing::Packet`、`Queue` | 只读共享编码包、有界队列、丢弃过期 GOP、取消旧代数 IO |
-| [annexb.hpp](src/annexb.hpp) / [annexb.cpp](src/annexb.cpp) | `ParameterSets`、`parameter_sets` | 声明/实现 H.264/H.265 参数集解析，不依赖 SDK 或 FFmpeg |
-| [network_route.hpp](src/network_route.hpp) | `LinkPolicy`、`NetworkRoute` 声明 | 切换策略、网络可用状态和代数接口 |
-| [network_route.cpp](src/network_route.cpp) | `reachable`、`route`、`run` | 绑定网卡探测、管理目标主机路由、检测源 IP 变化 |
-| [route_identity.hpp](src/route_identity.hpp) | `owned_stream_route`、`stream_route_state` | 校验路由归属，区分自己的路由、路由缺失和外部冲突 |
-| [fps_overlay.hpp](src/fps_overlay.hpp) / [fps_overlay.cpp](src/fps_overlay.cpp) | `FpsOverlay` | 原子计数实际视频帧数，约每秒更新两路 FPS 画布 |
-| [fps_text.hpp](src/fps_text.hpp) | `fps_text::draw` | 小尺寸点阵字体与 2BPP 像素布局，不依赖外部字体库 |
-| [service_state.hpp](src/service_state.hpp) | `ServiceState` | 独占 PID 文件锁，更新 starting/ready/stopping 和单调时钟心跳 |
-| [media_health.hpp](src/media_health.hpp) | `MediaHealth` | 记录 VENC/AENC/IVA 的有效进展，检测连续无进展 |
-| [config_validation.hpp](src/config_validation.hpp) | `config::validate` | 核心配置语义校验；不操作硬件、网络或写文件 |
-| [logger.cpp](src/logger.cpp) | `Logger` | 初始化、过滤、停止 EasyLogger |
-| [elog_port.c](src/elog_port.c) | `elog_port_*`、`prepare_log` | 线程安全日志端口、时间/线程信息、文件轮转和失败降级 |
+| [media.cpp](src/media/media.cpp) | `MediaRuntime::MediaPipeline` | 按依赖组织 ISP、IVA、MPI、推流、视频和音频，统一失败回滚 |
+| [media_channels.hpp](src/media/media_channels.hpp) | `Video`、`Audio`、`VideoSink`、`AudioSink` | 内部采集接口；通过函数指针注入输出，不依赖具体网络协议 |
+| [media_support.hpp](src/media/media_support.hpp) | `require_ok`、`cleanup` | 初始化错误转换为异常；记录清理前后及返回码 |
+| [video.cpp](src/media/video.cpp) | `Video::Impl` | VI/VENC、视频取流、IVA 旁路送帧、检测框与视频资源释放 |
+| [audio.cpp](src/media/audio.cpp) | `Audio::Impl` | AI/VQE/AENC 初始化、G711A 取流及音频资源释放 |
+| [ffmpeg_publisher.cpp](src/publisher/ffmpeg_publisher.cpp) | `PublisherSet`、`AsyncOutput`、`Output` | 编码包分发、独立发送线程、FFmpeg 封装、时间戳和重连 |
+| [publisher_queue.hpp](src/publisher/publisher_queue.hpp) | `publishing::Packet`、`Queue` | 只读共享编码包、有界队列、丢弃过期 GOP、取消旧代数 IO |
+| [annexb.hpp](src/publisher/annexb.hpp) / [annexb.cpp](src/publisher/annexb.cpp) | `ParameterSets`、`parameter_sets` | 声明/实现 H.264/H.265 参数集解析，不依赖 SDK 或 FFmpeg |
+| [network_route.hpp](src/network/network_route.hpp) | `LinkPolicy`、`NetworkRoute` 声明 | 切换策略、网络可用状态和代数接口 |
+| [network_route.cpp](src/network/network_route.cpp) | `reachable`、`route`、`run` | 绑定网卡探测、管理目标主机路由、检测源 IP 变化 |
+| [route_identity.hpp](src/network/route_identity.hpp) | `owned_stream_route`、`stream_route_state` | 校验路由归属，区分自己的路由、路由缺失和外部冲突 |
+| [fps_overlay.hpp](src/osd/fps_overlay.hpp) / [fps_overlay.cpp](src/osd/fps_overlay.cpp) | `FpsOverlay` | 原子计数实际视频帧数，约每秒更新两路 FPS 画布 |
+| [fps_text.hpp](src/osd/fps_text.hpp) | `fps_text::draw` | 小尺寸点阵字体与 2BPP 像素布局，不依赖外部字体库 |
+| [service_state.hpp](src/service/service_state.hpp) | `ServiceState` | 独占 PID 文件锁，更新 starting/ready/stopping 和单调时钟心跳 |
+| [media_health.hpp](src/media/media_health.hpp) | `MediaHealth` | 记录 VENC/AENC/IVA 的有效进展，检测连续无进展 |
+| [config_validation.hpp](src/config/config_validation.hpp) | `config::validate` | 核心配置语义校验；不操作硬件、网络或写文件 |
+| [logger.cpp](src/logging/logger.cpp) | `Logger` | 初始化、过滤、停止 EasyLogger |
+| [elog_port.c](src/logging/elog_port.c) | `elog_port_*`、`prepare_log` | 线程安全日志端口、时间/线程信息、文件轮转和失败降级 |
 
 ### 1.3 `common/`：复用官方实现，而不是另写一套 SDK
 
@@ -654,7 +667,7 @@ g++ -std=c++11 -Wall -Wextra -Isrc \
   tests/route_identity_test.cpp -o /tmp/gzh-route-test
 /tmp/gzh-route-test
 g++ -std=c++11 -Wall -Wextra -Isrc \
-  tests/annexb_test.cpp src/annexb.cpp -o /tmp/gzh-annexb-test
+  tests/annexb_test.cpp src/publisher/annexb.cpp -o /tmp/gzh-annexb-test
 /tmp/gzh-annexb-test
 gcc -std=gnu99 tests/frame_wait_test.c -o /tmp/gzh-frame-test
 /tmp/gzh-frame-test
@@ -662,7 +675,7 @@ git diff --check
 ```
 
 可为 C/C++ 测试添加 `-fsanitize=address,undefined -fno-omit-frame-pointer` 检查越界/未定义行为。
-配置测试还需链接 `common/param`、EasyLogger 核心及 `src/elog_port.c`，C 文件使用 C 编译器，
+配置测试还需链接 `common/param`、EasyLogger 核心及 `src/logging/elog_port.c`，C 文件使用 C 编译器，
 再用 C++ 编译器与 `tests/config_test.cpp` 链接；它通过临时目录和子进程文件大小限制模拟保存失败。
 主机测试只证明相应逻辑，不替代 SDK 和板端验证。
 
@@ -699,7 +712,7 @@ dmesg | tail -80
 ## 14. 初学者的推荐阅读路线
 
 1. 先看第 1 节文件职责，再看第 4 节启动流程，理解 `main()` 不直接逐帧发送。
-2. 打开 `include/media.hpp` 和 `src/media.cpp`，看对象拥有关系，**不要把嵌套类当继承**。
+2. 打开 `include/media.hpp` 和 `src/media/media.cpp`，看对象拥有关系，**不要把嵌套类当继承**。
 3. 沿第 5 节跟踪一帧：GetStream → 回调复制 → 入队 → ReleaseStream → 发送线程。
 4. 再读 `PublisherSet` → `AsyncOutput` → `Output`，区分分发、调度与协议封装。
 5. 最后看 IVA 回调、网络代数、服务恢复和第 9 节退出顺序。
