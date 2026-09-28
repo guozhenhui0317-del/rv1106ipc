@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
          * Parameters 再销毁配置字典，最后 Logger 关闭日志文件。
          */
         // 最先取得单实例锁，最后释放：重复启动不会触碰配置、摄像头或日志。
-        ServiceState service;
+        ServiceState service_state;
         Logger logger("/root/rkipc.log");
         Parameters parameters(ini);
         config::validate(g_ini_d_); // 必须早于任何 ISP/MPI/IVA 和网络初始化。
@@ -140,11 +140,12 @@ int main(int argc, char **argv) {
         LOG_INFO("starting with ini=%s iq=%s", ini.c_str(), iq.c_str());
         MediaHealth::instance().reset(rk_param_get_int("audio.0:enable", 1) != 0,
                                       rk_param_get_int("video.source:enable_npu", 1) != 0);
-        MediaRuntime media(iq);  // 实例化MediaRuntime类，并传入iq file路径
-        service.set("ready"); // 媒体初始化完成；网络发布仍可能等待接收端和关键帧。
+        // 构造成功即表示媒体硬件和采集线程已就绪；析构会完成全部反序清理。
+        MediaRuntime media_runtime(iq);
+        service_state.set("ready"); // 网络发布仍可能等待接收端和关键帧。
         int exit_code = 0;
         while (g_running) {
-            service.set("ready"); // /run 中的单调时钟心跳，不写入闪存。
+            service_state.set("ready"); // /run 中的单调时钟心跳，不写入闪存。
             if (const char *channel = MediaHealth::instance().stalled()) {
                 LOG_ERROR("health: %s has no progress for 60 seconds; requesting graceful recovery", channel);
                 exit_code = 1;
@@ -152,7 +153,7 @@ int main(int argc, char **argv) {
             }
             sleep(1);
         }
-        service.set("stopping");
+        service_state.set("stopping");
         LOG_INFO("shutdown requested");
         return exit_code;
     } catch (const std::exception &error) {

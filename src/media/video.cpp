@@ -1,5 +1,20 @@
 #define LOG_TAG "media"
 
+/**
+ * @file video.cpp
+ * @brief 管理两路视频硬件通道以及编码、RockIVA 和检测框线程。
+ *
+ * @details 数据流和线程边界：
+ * @verbatim
+ * VI0 --bind--> VENC0 --main_stream_thread_--> VideoSink --> publisher
+ * VI1 --bind--> VENC1 --ai_stream_thread_----> VideoSink --> publisher
+ *   `--GetChnFrame/DMABUF--iva_input_thread_--> RockIVA
+ *                                `--检测结果--> detection_overlay_thread_--> RGN7/VENC1
+ * @endverbatim
+ * VideoPipeline 独占上述通道和线程。采集回调只复制编码数据，不执行网络 IO；
+ * shutdown() 先停止并 join 全部线程，再按 Attach/Bind/Create 的反序释放硬件。
+ */
+
 #include "media/media_channels.hpp"
 #include "media/media_support.hpp"
 #include "osd/fps_overlay.hpp"
@@ -92,44 +107,22 @@ bool key_frame(int id, const VENC_PACK_S &pack) {
 
 } // namespace
 
-class Video::Impl final {
+class Video::VideoPipeline final {
 public:
     /**
      * @brief 创建两路 VI/VENC、可选 RGN，并启动视频线程。
-     *
+     * @param[in] sink 编码帧接收函数；在视频取流线程中同步调用。
      * @throws std::runtime_error 初始化或 SDK 操作失败。
      */
-    explicit Impl(VideoSink sink) : sink_(sink) {
+    explicit VideoPipeline(VideoSink sink) : sink_(sink) {
         if (!sink_)
             throw std::invalid_argument("video sink is required");
         try {
-            /*
-             * 建链顺序遵循 RK MPI：先启用 VI/VENC，再绑定，最后启动取流线程。
-             * VI1 同时绑定 VENC1 并设置 depth=1，让 RockIVA 可以旁路 GetFrame；
-             * 这是本工程只使用两个 VI 通道的关键。
-             */
-            npu_ = rk_param_get_int("video.source:enable_npu", 1) != 0;
-            init_device();
-            create_vi(kMain);
-            create_vi(kAi);
-            create_venc(kMain);
-            create_venc(kAi);
-            bind(kMain);
-            bind(kAi);
-            if (npu_)
-                create_overlay();
-            if (rk_param_get_int("osd:enable_fps", 1))
-                fps_.reset(new FpsOverlay());
-            running_ = true;
-            main_thread_ = std::thread(&Impl::venc_loop, this, kMain);
-            ai_stream_thread_ = std::thread(&Impl::venc_loop, this, kAi);
-            if (npu_) {
-                inference_thread_ = std::thread(&Impl::inference_loop, this);
-                overlay_thread_ = std::thread(&Impl::overlay_loop, this);
-            }
+            initialize_channels();
+            start_workers();
             LOG_INFO("video ready: VI0->VENC0 main, VI1->VENC1 AI stream");
         } catch (...) {
-            stop();
+            shutdown();
             throw;
         }
     }
@@ -137,9 +130,44 @@ public:
     /**
      * @brief 停止视频线程并释放视频资源。
      */
-    ~Impl() { stop(); }
+    ~VideoPipeline() { shutdown(); }
 
 private:
+    /**
+     * @brief 按 RK MPI 依赖顺序创建 VI、VENC 和可选 OSD 资源。
+     * @return 无返回值。
+     * @throws std::runtime_error 任一 SDK 初始化调用失败。
+     */
+    void initialize_channels() {
+        rockiva_enabled_ = rk_param_get_int("video.source:enable_npu", 1) != 0;
+        init_device();
+        create_vi(kMain);
+        create_vi(kAi);
+        create_venc(kMain);
+        create_venc(kAi);
+        bind(kMain);
+        bind(kAi);
+        if (rockiva_enabled_)
+            create_overlay();
+        if (rk_param_get_int("osd:enable_fps", 1))
+            fps_.reset(new FpsOverlay());
+    }
+
+    /**
+     * @brief 在全部硬件通道就绪后启动视频相关线程。
+     * @return 无返回值。
+     * @throws std::system_error 线程创建失败。
+     */
+    void start_workers() {
+        running_ = true;
+        main_stream_thread_ = std::thread(&VideoPipeline::capture_encoded_video, this, kMain);
+        ai_stream_thread_ = std::thread(&VideoPipeline::capture_encoded_video, this, kAi);
+        if (rockiva_enabled_) {
+            iva_input_thread_ = std::thread(&VideoPipeline::submit_frames_to_rockiva, this);
+            detection_overlay_thread_ = std::thread(&VideoPipeline::refresh_detection_overlay, this);
+        }
+    }
+
     /**
      * @brief 配置并启用 VI 设备 0。
      *
@@ -181,7 +209,7 @@ private:
          */
         VI_CHN_ATTR_S attr;
         memset(&attr, 0, sizeof(attr));
-        attr.stIspOpt.u32BufCount = value(id, "input_buffer_count", id == kAi && npu_ ? 3 : 2);
+        attr.stIspOpt.u32BufCount = value(id, "input_buffer_count", id == kAi && rockiva_enabled_ ? 3 : 2);
         /* DMABUF fd 可直接交给 RockIVA，避免把 NV12 图像复制到用户态。 */
         attr.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
         attr.stIspOpt.stMaxSize.u32Width = value(id, "max_width", id ? 640 : 1920);
@@ -190,7 +218,7 @@ private:
         attr.stSize.u32Height = value(id, "height", id ? 360 : 1080);
         attr.enPixelFormat = RK_FMT_YUV420SP;
         attr.enCompressMode = COMPRESS_MODE_NONE;
-        attr.u32Depth = id == kAi && npu_ ? 1 : 0;
+        attr.u32Depth = id == kAi && rockiva_enabled_ ? 1 : 0;
         attr.stFrameRate.s32SrcFrameRate = rk_param_get_int("isp.0.adjustment:fps", 25);
         attr.stFrameRate.s32DstFrameRate = value(id, "dst_frame_rate_num", 25) /
                                            std::max(1, value(id, "dst_frame_rate_den", 1));
@@ -398,8 +426,9 @@ private:
      * @brief 持续取得 VENC 码流并交给 publisher。
      *
      * @param[in] id 媒体通道编号。
+     * @return 无返回值；仅对应 VENC 取流线程调用。
      */
-    void venc_loop(int id) {
+    void capture_encoded_video(int id) {
         /* 每个 VENC 独立阻塞取流，避免一路网络/编码抖动阻塞另一路。 */
         prctl(PR_SET_NAME, id == kMain ? "venc-main" : "venc-ai", 0, 0, 0);
         VENC_PACK_S pack;
@@ -441,8 +470,9 @@ private:
 
     /**
      * @brief 从 VI1 取得 DMABUF 帧并送入 RockIVA。
+     * @return 无返回值；仅 RockIVA 输入线程调用。
      */
-    void inference_loop() {
+    void submit_frames_to_rockiva() {
         /*
          * AI 推理频率通常低于编码帧率。用 steady_clock 限频不会受系统时间校准
          * 影响；若一次推理已经超过周期则不额外 sleep，避免延迟继续累积。
@@ -511,8 +541,9 @@ private:
 
     /**
      * @brief 读取检测结果并周期性刷新 VENC1 Overlay。
+     * @return 无返回值；仅检测框刷新线程调用。
      */
-    void overlay_loop() {
+    void refresh_detection_overlay() {
         /*
          * RockIVA 回调和 RGN canvas 更新解耦：本线程取最新检测结果，以 25 Hz
          * 刷新。300 ms 未收到结果便清框，避免目标离开后旧框长期残留。
@@ -560,23 +591,24 @@ private:
 
     /**
      * @brief 停止视频线程并反序释放 RGN、VENC 和 VI。
+     * @return 无返回值。
      */
-    void stop() noexcept {
+    void shutdown() noexcept {
         /*
          * 先置 false 并等待所有线程退出，保证没有线程再访问 MPI handle；随后
          * 按 Attach/Bind/Create 的严格反序释放。每个布尔标志只表示对应调用
-         * 已成功，因此构造函数在任意中间步骤抛异常时也能安全调用 stop()。
+         * 已成功，因此构造函数在任意中间步骤抛异常时也能安全调用 shutdown()。
          */
         running_ = false;
-        LOG_INFO("shutdown: join inference_thread_ begin");
-        if (inference_thread_.joinable()) inference_thread_.join();
-        LOG_INFO("shutdown: join inference_thread_ done");
-        LOG_INFO("shutdown: join overlay_thread_ begin");
-        if (overlay_thread_.joinable()) overlay_thread_.join();
-        LOG_INFO("shutdown: join overlay_thread_ done");
-        LOG_INFO("shutdown: join main_thread_ begin");
-        if (main_thread_.joinable()) main_thread_.join();
-        LOG_INFO("shutdown: join main_thread_ done");
+        LOG_INFO("shutdown: join iva_input_thread_ begin");
+        if (iva_input_thread_.joinable()) iva_input_thread_.join();
+        LOG_INFO("shutdown: join iva_input_thread_ done");
+        LOG_INFO("shutdown: join detection_overlay_thread_ begin");
+        if (detection_overlay_thread_.joinable()) detection_overlay_thread_.join();
+        LOG_INFO("shutdown: join detection_overlay_thread_ done");
+        LOG_INFO("shutdown: join main_stream_thread_ begin");
+        if (main_stream_thread_.joinable()) main_stream_thread_.join();
+        LOG_INFO("shutdown: join main_stream_thread_ done");
         LOG_INFO("shutdown: join ai_stream_thread_ begin");
         if (ai_stream_thread_.joinable()) ai_stream_thread_.join();
         LOG_INFO("shutdown: join ai_stream_thread_ done");
@@ -616,18 +648,18 @@ private:
     VideoSink sink_;
     std::unique_ptr<FpsOverlay> fps_;
     std::atomic<bool> running_{false};
-    bool npu_ = false;
+    bool rockiva_enabled_ = false;
     bool device_ = false;
     bool vi_created_[2] = {false, false};
     bool venc_created_[2] = {false, false};
     bool bound_[2] = {false, false};
     bool overlay_created_ = false;
     bool overlay_attached_ = false;
-    std::thread main_thread_, ai_stream_thread_, inference_thread_, overlay_thread_;
+    std::thread main_stream_thread_, ai_stream_thread_, iva_input_thread_, detection_overlay_thread_;
 };
 
 
-Video::Video(VideoSink sink) : impl_(new Impl(sink)) {}
+Video::Video(VideoSink sink) : pipeline_(new VideoPipeline(sink)) {}
 Video::~Video() = default;
 
 } // namespace media_detail

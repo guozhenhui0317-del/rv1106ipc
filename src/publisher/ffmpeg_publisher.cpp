@@ -1,3 +1,29 @@
+/**
+ * @file ffmpeg_publisher.cpp
+ * @brief 把硬件编码包异步扇出到彼此隔离的 RTSP/RTMP 连接。
+ *
+ * @details 调用和线程关系：
+ * @verbatim
+ * VENC/AENC 采集线程
+ *   -> ffmpeg_publisher_write_*（立即复制）
+ *   -> PublisherManager（按通道扇出）
+ *   -> PublisherEndpoint（每个 URL 一份有界队列和发送线程）
+ *   -> FfmpegConnection（仅该发送线程访问 AVFormatContext）
+ * @endverbatim
+ * 每个端点的概念状态机：
+ * @verbatim
+ * 等待关键帧/参数集 --完整关键帧--> 连接服务器 --成功--> 正在发布
+ *        ^                           |                   |
+ *        |                           `--失败-------------'
+ *        |                                  |
+ *        `-------- 等待 3 秒后下一关键帧 <--'
+ *
+ * 网络代数变化或队列丢包 -> 关闭旧连接/丢弃旧 GOP -> 回到等待关键帧
+ * @endverbatim
+ * FFmpeg 只封装和发送，不重新编码。端点失败只重置自己的队列与连接，不阻塞
+ * 采集线程，也不影响其他 URL。
+ */
+
 #include "ffmpeg_publisher.h"
 #include "publisher/annexb.hpp"
 #include "network/network_route.hpp"
@@ -156,28 +182,35 @@ struct EndpointConfig {
     bool audio;
 };
 
-class Output final {
+/**
+ * @brief 独占一个 URL 的 AVFormatContext、媒体轨、时间原点和重连状态。
+ * @details 只能由所属 PublisherEndpoint 的发送线程调用；network 和 queue
+ *          是非拥有指针，其生命周期由外层对象保证。
+ */
+class FfmpegConnection final {
 public:
     /**
      * @brief 保存一个网络端点配置。
      *
      * @param[in] config 网络推流端点配置。
+     * @param[in] network 共享网络状态；可为空，由 PublisherManager 持有。
+     * @param[in] queue 所属端点队列；用于中断旧代数 IO。
      */
-    explicit Output(EndpointConfig config, NetworkRoute *network, const publishing::Queue *queue)
+    explicit FfmpegConnection(EndpointConfig config, NetworkRoute *network, const publishing::Queue *queue)
         : config_(std::move(config)), network_(network), queue_(queue),
           timeout_ms_(std::max(100, std::min(60000,
               rk_param_get_int("stream:io_timeout_ms", 5000)))) {}
     /**
      * @brief 关闭网络输出并释放 FFmpeg 上下文。
      */
-    ~Output() { close(); }
+    ~FfmpegConnection() { close(); }
 
     /** @brief 丢包后重建该端点，并应用采集侧保留的参数集。
      * @param epoch 本包队列代数。
      * @param extra 参数集快照，即使首个关键帧被丢弃也保留。
      * @return 无返回值；仅发送线程调用。
      */
-    void prepare(unsigned epoch, const std::shared_ptr<const std::string> &extra) {
+    void synchronize_queue_epoch(unsigned epoch, const std::shared_ptr<const std::string> &extra) {
         if (queue_epoch_ != epoch) { close(false); queue_epoch_ = epoch; }
         if (extra && !extra->empty() && codec_extra_ != *extra) codec_extra_ = *extra;
     }
@@ -194,7 +227,7 @@ public:
      */
     int write_video(const void *data, size_t size, uint64_t pts_us, bool key) {
         /*
-         * 同一 Output 的音视频由唯一发送线程串行处理，不在采集线程访问
+         * 同一 FfmpegConnection 的音视频由唯一发送线程串行处理，不在采集线程访问
          * AVFormatContext。未连接或断线后只在关键帧上打开，保证接收端从
          * 完整 GOP 开始解码；3 秒退避避免服务器离线时高速重复连接刷日志。
          */
@@ -213,7 +246,7 @@ public:
             }
         }
         // 即使网络离线，也先缓存首帧参数集；编码器后续关键帧可能不重复 SPS/PPS。
-        if (!sync_route()) return 0;
+        if (!synchronize_network_route()) return 0;
         if (!ready_) {
             if (!key || codec_extra_.empty() ||
                 std::chrono::steady_clock::now() < retry_after_)
@@ -241,7 +274,7 @@ public:
          * 视频关键帧定义整个端点的时间原点。它到达以前不能写音频，否则
          * muxer 没有 header；早于原点的音频也必须丢弃以防无符号减法下溢。
          */
-        if (!sync_route() || !ready_ || !audio_ || pts_us < origin_us_)
+        if (!synchronize_network_route() || !ready_ || !audio_ || pts_us < origin_us_)
             return 0;
         return write_packet(audio_, data, size, pts_us, false,
                             static_cast<int>(size) / std::max(1, audio_->codecpar->channels));
@@ -250,11 +283,11 @@ public:
 private:
     /**
      * @brief 检查退出、超时或路由变化，中断 FFmpeg 阻塞 IO。
-     * @param opaque 当前 Output；FFmpeg 同步调用，不获取音视频锁。
+     * @param opaque 当前 FfmpegConnection；FFmpeg 同步调用，不获取音视频锁。
      * @return 非零表示取消本次 IO。
      */
     static int interrupt(void *opaque) {
-        auto &self = *static_cast<Output *>(opaque);
+        auto &self = *static_cast<FfmpegConnection *>(opaque);
         return g_stopping.load() || self.queue_->cancelled(self.queue_epoch_) ||
                std::chrono::steady_clock::now() >= self.deadline_ ||
                (self.network_ && (!self.network_->ready() ||
@@ -267,7 +300,7 @@ private:
     }
 
     /** @brief 在独立发送线程内使旧连接失效。 @return 当前是否允许推流。 */
-    bool sync_route() {
+    bool synchronize_network_route() {
         if (g_stopping) return false;
         if (!network_) return true;
         const unsigned generation = network_->generation();
@@ -498,7 +531,7 @@ private:
     }
 
     EndpointConfig config_;
-    NetworkRoute *network_; // PublisherSet 拥有，销毁顺序晚于所有 Output。
+    NetworkRoute *network_; // PublisherManager 拥有，销毁顺序晚于所有连接。
     const publishing::Queue *queue_;
     unsigned queue_epoch_ = 0;
     int timeout_ms_;
@@ -516,15 +549,19 @@ private:
     std::chrono::steady_clock::time_point retry_after_{};
 };
 
-/** @brief 一个 URL 一个发送线程；队列锁不跨越任何 FFmpeg 网络调用。 */
-class AsyncOutput final {
+/**
+ * @brief 为一个 URL 持有独立队列、发送线程和 FFmpeg 连接。
+ * @details 队列锁不跨越网络调用；析构先取消 IO、停止队列并 join 线程，
+ *          然后成员析构才释放 FfmpegConnection 和 Queue。
+ */
+class PublisherEndpoint final {
 public:
     /** @brief 创建隔离端点。 @param config 输出配置。 @param network 共享链路状态。 */
-    AsyncOutput(EndpointConfig config, NetworkRoute *network)
-        : name_(config.name), output_(std::move(config), network, &queue_),
-          worker_(&AsyncOutput::run, this) {}
+    PublisherEndpoint(EndpointConfig config, NetworkRoute *network)
+        : name_(config.name), connection_(std::move(config), network, &queue_),
+          worker_(&PublisherEndpoint::send_loop, this) {}
     /** @brief 先取消 IO、停止队列，再等待线程退出；之后才释放 FFmpeg。 */
-    ~AsyncOutput() { queue_.stop(); if (worker_.joinable()) worker_.join(); }
+    ~PublisherEndpoint() { queue_.stop(); if (worker_.joinable()) worker_.join(); }
     /** @brief 仅入队，不做网络 IO。 @param packet 自有编码包。 @return 0 入队，-1 丢弃。 */
     int enqueue(const publishing::Packet &packet) noexcept {
         try { return queue_.push(packet) ? 0 : -1; }
@@ -534,7 +571,7 @@ public:
     void discard() { queue_.reset(); }
 private:
     /** @brief 独占访问本端点 FFmpeg；失败与丢包只影响本队列。 @return 无返回值。 */
-    void run() {
+    void send_loop() {
         prctl(PR_SET_NAME, name_.c_str(), 0, 0, 0);
         publishing::Packet packet;
         unsigned epoch = 0;
@@ -550,10 +587,10 @@ private:
                              static_cast<unsigned long long>(drops));
                     last_drops = drops; last_log = now;
                 }
-                output_.prepare(epoch, packet.extra);
+                connection_.synchronize_queue_epoch(epoch, packet.extra);
                 const int ret = packet.video
-                    ? output_.write_video(packet.data->data(), packet.data->size(), packet.pts, packet.key)
-                    : output_.write_audio(packet.data->data(), packet.data->size(), packet.pts);
+                    ? connection_.write_video(packet.data->data(), packet.data->size(), packet.pts, packet.key)
+                    : connection_.write_audio(packet.data->data(), packet.data->size(), packet.pts);
                 if (ret < 0) queue_.reset();
             } catch (const std::exception &error) {
                 LOG_ERROR("%s isolated worker error: %s", name_.c_str(), error.what());
@@ -563,31 +600,36 @@ private:
         }
     }
     std::string name_;
-    publishing::Queue queue_; // 必须比 Output 活得更久，供中断回调读取。
-    Output output_;
+    publishing::Queue queue_; // 必须比 FfmpegConnection 活得更久，供中断回调读取。
+    FfmpegConnection connection_;
     std::thread worker_;
 };
 
-class PublisherSet final {
+/**
+ * @brief 读取配置、创建全部启用端点并把采集包按通道扇出。
+ * @details 采集线程只调用 enqueue_video()/enqueue_audio()；网络 IO 由各
+ *          PublisherEndpoint 自己的发送线程完成。
+ */
+class PublisherManager final {
 public:
     /**
      * @brief 初始化网络层并创建启用的端点。
      */
-    PublisherSet() {
+    PublisherManager() {
         /*
          * RTSP 与 RTMP 使用不同 URL/path，因此是四个独立 publisher：
          * main RTSP/RTMP 含音频，AI RTSP/RTMP 仅视频。
          */
         av_log_set_callback(ffmpeg_log);
-        setup_route();
+        initialize_network_route();
         if (avformat_network_init() < 0) throw std::runtime_error("FFmpeg network init failed");
         try {
-            add("rtsp-main", "stream:enable_rtsp", "stream:rtsp_main_url", "rtsp", 0, true);
-            add("rtmp-main", "stream:enable_rtmp", "stream:rtmp_main_url", "flv", 0, true);
-            add("rtsp-ai", "stream:enable_rtsp", "stream:rtsp_ai_url", "rtsp", 1, false);
-            add("rtmp-ai", "stream:enable_rtmp", "stream:rtmp_ai_url", "flv", 1, false);
+            add_endpoint("rtsp-main", "stream:enable_rtsp", "stream:rtsp_main_url", "rtsp", 0, true);
+            add_endpoint("rtmp-main", "stream:enable_rtmp", "stream:rtmp_main_url", "flv", 0, true);
+            add_endpoint("rtsp-ai", "stream:enable_rtsp", "stream:rtsp_ai_url", "rtsp", 1, false);
+            add_endpoint("rtmp-ai", "stream:enable_rtmp", "stream:rtmp_ai_url", "flv", 1, false);
         } catch (...) {
-            outputs_.clear(); // 局部端点先停线程，之后才释放网络全局资源。
+            endpoints_.clear(); // 局部端点先停线程，之后才释放网络全局资源。
             avformat_network_deinit();
             throw;
         }
@@ -595,8 +637,8 @@ public:
     /**
      * @brief 销毁端点并反初始化网络层。
      */
-    ~PublisherSet() {
-        outputs_.clear();
+    ~PublisherManager() {
+        endpoints_.clear();
         avformat_network_deinit();
     }
     /**
@@ -610,9 +652,9 @@ public:
      *
      * @return 端点结果的按位或，0 表示均成功。
      */
-    int video(int id, const void *data, size_t size, uint64_t pts, bool key) {
+    int enqueue_video(int id, const void *data, size_t size, uint64_t pts, bool key) {
         if (g_stopping || id < 0 || id > 1 || !data || !size || size > 2 * 1024 * 1024) {
-            if (id >= 0 && id <= 1) discard(id);
+            if (id >= 0 && id <= 1) discard_channel(id);
             return -1;
         }
         try {
@@ -630,10 +672,10 @@ public:
             packet.extra = extra_[id];
             packet.pts = pts; packet.video = true; packet.key = key;
             int ret = 0;
-            for (auto &output : outputs_)
-                if (output.first == id) ret |= output.second->enqueue(packet);
+            for (auto &endpoint : endpoints_)
+                if (endpoint.first == id) ret |= endpoint.second->enqueue(packet);
             return ret;
-        } catch (const std::exception &) { discard(id); return -1; }
+        } catch (const std::exception &) { discard_channel(id); return -1; }
     }
     /**
      * @brief 把音频扇出到所有主码流端点。
@@ -644,7 +686,7 @@ public:
      *
      * @return 端点结果的按位或，0 表示均成功。
      */
-    int audio(const void *data, size_t size, uint64_t pts) {
+    int enqueue_audio(const void *data, size_t size, uint64_t pts) {
         if (g_stopping || !data || !size || size > 2 * 1024 * 1024) return -1;
         try {
             publishing::Packet packet;
@@ -652,22 +694,22 @@ public:
             packet.data = std::make_shared<const std::vector<uint8_t>>(bytes, bytes + size);
             packet.pts = pts;
             int ret = 0;
-            for (auto &output : outputs_)
-                if (output.first == 0) ret |= output.second->enqueue(packet);
+            for (auto &endpoint : endpoints_)
+                if (endpoint.first == 0) ret |= endpoint.second->enqueue(packet);
             return ret;
-        } catch (const std::exception &) { discard(0); return -1; }
+        } catch (const std::exception &) { discard_channel(0); return -1; }
     }
 
 private:
     /** @brief 丢弃指定媒体通道的输出 GOP。 @param id 媒体通道号。 @return 无返回值。 */
-    void discard(int id) {
-        for (auto &output : outputs_) if (output.first == id) output.second->discard();
+    void discard_channel(int id) {
+        for (auto &endpoint : endpoints_) if (endpoint.first == id) endpoint.second->discard();
     }
     /**
      * @brief 从启用的 URL 提取唯一接收端，建立可选网络切换模块。
      * @throws std::runtime_error 接收地址不一致或路由初始化失败。
      */
-    void setup_route() {
+    void initialize_network_route() {
         if (!rk_param_get_int("network:enable_failover", 0)) return;
         const char *keys[] = {"stream:rtsp_main_url", "stream:rtsp_ai_url",
                               "stream:rtmp_main_url", "stream:rtmp_ai_url"};
@@ -702,24 +744,24 @@ private:
      * @param[in] id 媒体通道编号。
      * @param[in] audio 端点是否包含音频轨道。
      */
-    void add(const char *name, const char *enable_key, const char *url_key,
+    void add_endpoint(const char *name, const char *enable_key, const char *url_key,
              const char *format, int id, bool audio) {
         if (!rk_param_get_int(enable_key, 0))
             return;
         const char *url = rk_param_get_string(url_key, "");
         if (url && url[0])
-            outputs_.push_back({id, std::unique_ptr<AsyncOutput>(
-                new AsyncOutput(EndpointConfig{name, url, format, id, audio}, network_.get()))});
+            endpoints_.push_back({id, std::unique_ptr<PublisherEndpoint>(
+                new PublisherEndpoint(EndpointConfig{name, url, format, id, audio}, network_.get()))});
     }
     std::unique_ptr<NetworkRoute> network_;
-    std::vector<std::pair<int, std::unique_ptr<AsyncOutput>>> outputs_;
+    std::vector<std::pair<int, std::unique_ptr<PublisherEndpoint>>> endpoints_;
     std::array<std::shared_ptr<const std::string>, 2> extra_;
 
 };
 
-std::unique_ptr<PublisherSet> g_publishers;
+std::unique_ptr<PublisherManager> g_publisher_manager;
 /* init/deinit 是控制面操作；采集只入队，运行期 FFmpeg 由独立发送线程持有。 */
-std::mutex g_publishers_lock;
+std::mutex g_publisher_lock;
 
 } // namespace
 
@@ -729,8 +771,8 @@ std::mutex g_publishers_lock;
  * @return 0 表示成功，-1 表示失败。
  */
 extern "C" int ffmpeg_publisher_init(void) {
-    std::lock_guard<std::mutex> guard(g_publishers_lock);
-    if (g_publishers)
+    std::lock_guard<std::mutex> guard(g_publisher_lock);
+    if (g_publisher_manager)
         return 0;
     if (!publisher_self_check()) {
         LOG_ERROR("internal Annex-B parameter-set parser self-check failed");
@@ -776,7 +818,7 @@ extern "C" int ffmpeg_publisher_init(void) {
         return -1;
     }
     g_stopping = false;
-    try { g_publishers.reset(new PublisherSet()); }
+    try { g_publisher_manager.reset(new PublisherManager()); }
     catch (const std::exception &error) {
         LOG_ERROR("publisher init failed: %s", error.what());
         return -1;
@@ -789,8 +831,8 @@ extern "C" void ffmpeg_publisher_interrupt(void) { g_stopping = true; }
 
 /** @brief 销毁全局推流集合；必须在采集线程退出后调用。 */
 extern "C" void ffmpeg_publisher_deinit(void) {
-    std::lock_guard<std::mutex> guard(g_publishers_lock);
-    g_publishers.reset();
+    std::lock_guard<std::mutex> guard(g_publisher_lock);
+    g_publisher_manager.reset();
 }
 
 /**
@@ -806,7 +848,7 @@ extern "C" void ffmpeg_publisher_deinit(void) {
  */
 extern "C" int ffmpeg_publisher_write_video(int id, const void *data, size_t size,
                                               uint64_t pts, int key) {
-    return g_publishers ? g_publishers->video(id, data, size, pts, key != 0) : -1;
+    return g_publisher_manager ? g_publisher_manager->enqueue_video(id, data, size, pts, key != 0) : -1;
 }
 
 /**
@@ -819,5 +861,5 @@ extern "C" int ffmpeg_publisher_write_video(int id, const void *data, size_t siz
  * @return 集合处理结果；未初始化时返回 -1。
  */
 extern "C" int ffmpeg_publisher_write_audio(const void *data, size_t size, uint64_t pts) {
-    return g_publishers ? g_publishers->audio(data, size, pts) : -1;
+    return g_publisher_manager ? g_publisher_manager->enqueue_audio(data, size, pts) : -1;
 }
